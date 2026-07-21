@@ -1,0 +1,38 @@
+name: 自動剪片
+
+on:
+  workflow_dispatch:          # 手動按按鈕 + 外部排程（cron-job.org）+ 手機捷徑都走這個入口
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300      # GitHub 單次上限是360分鐘，留一點餘裕
+    steps:
+      - name: 取得程式碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 ffmpeg 與中文字型
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-noto-cjk
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 寫入 Google 服務帳戶金鑰
+        env:
+          GOOGLE_SHEET_KEY_JSON: ${{ secrets.GOOGLE_SHEET_KEY_JSON }}
+        run: echo "$GOOGLE_SHEET_KEY_JSON" > service_account.json
+
+      - name: 執行剪片流程
+        env:
+          GOOGLE_SHEET_KEY_PATH: service_account.json
+          DRIVE_ROOT_FOLDER_ID: ${{ secrets.DRIVE_ROOT_FOLDER_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python run_batch.py
