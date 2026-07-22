@@ -1,25 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-自動剪片 —— 主流程
+自動剪片 —— 主流程（v2：貼圖/音樂改從 Google Drive 抓）
 
-執行一次會做：
-  1. 到 Google Drive 的「01_待處理」找批次資料夾（一個資料夾＝一批素材）
-  2. 由舊到新，一次處理一批：下載素材 -> 正規化 -> 套用所有模板 -> 上傳成品到「02_完成」
-  3. 該批的原素材資料夾搬到「03_已處理素材」
-  4. 每批處理完立刻上傳（就算後面被中斷，前面的成果也不會白做）
-  5. 全部結束後發 Discord 通知
+流程：
+  1. 掃 Drive「01_待處理」找批次資料夾（一個資料夾＝一批）
+  2. 開機時先把 Drive 的音樂＋三類貼圖下載到本機（整輪共用，只抓一次）
+  3. 由舊到新，一次一批：下載素材 -> 正規化 -> 套10個模板 -> 上傳成品到「02_完成」
+  4. 該批原素材搬到「03_已處理素材」
+  5. 每批處理完立刻上傳；全部結束發 Discord 通知
 
-單次最多處理 MAX_BATCHES_PER_RUN 批，剩下的等下一輪觸發再接手
-（GitHub Actions 單次執行有6小時上限，這是避免撞到上限的保險）。
+單次最多 MAX_BATCHES_PER_RUN 批（GitHub Actions 單次6小時上限的保險）。
+
+素材放 Drive（手機就能加，不用碰 GitHub）：
+  自動剪片/音樂/           所有音樂，隨機抽，檔名隨便
+  自動剪片/貼圖/浮誇/       愛心星星爆炸
+  自動剪片/貼圖/一般/       箭頭標籤
+  自動剪片/貼圖/簡約/       低調文青
+  空資料夾不會出錯，抽到該類就自動不放貼圖。
 
 環境變數：
-  GOOGLE_SHEET_KEY_PATH   服務帳戶 json 金鑰檔路徑（沿用現有那組服務帳戶即可）
-  DRIVE_ROOT_FOLDER_ID    Drive 上「自動剪片」資料夾的 ID
-  DISCORD_WEBHOOK_URL     Discord 通知用的 webhook 網址
+  GOOGLE_SHEET_KEY_PATH   服務帳戶 json 金鑰路徑
+  DRIVE_ROOT_FOLDER_ID    「自動剪片」資料夾 ID
+  DISCORD_WEBHOOK_URL     Discord webhook
+  OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / OAUTH_REFRESH_TOKEN  你本人上傳授權（成品吃5TB）
 """
 
 import json
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -36,21 +44,13 @@ import render
 
 GOOGLE_KEY_PATH = (os.environ.get("GOOGLE_SHEET_KEY_PATH") or "").strip()
 DISCORD_WEBHOOK_URL = (os.environ.get("DISCORD_WEBHOOK_URL") or "").strip()
-
-# 上傳成品用「你本人」的 OAuth 授權（吃你的 5TB），其他讀寫維持服務帳戶。
-# 這三個值由本機跑一次 get_token.py 取得後，存進 GitHub Secrets。
 OAUTH_CLIENT_ID = (os.environ.get("OAUTH_CLIENT_ID") or "").strip()
 OAUTH_CLIENT_SECRET = (os.environ.get("OAUTH_CLIENT_SECRET") or "").strip()
 OAUTH_REFRESH_TOKEN = (os.environ.get("OAUTH_REFRESH_TOKEN") or "").strip()
 OAUTH_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 
-def _clean_folder_id(raw: str) -> str:
-    """把使用者可能貼錯的格式清成純資料夾ID。
-
-    常見貼錯：整條網址、尾巴帶 ?usp=drive_link、前後有空白或換行
-    （GitHub Secrets 會原封不動保留空白，這種錯誤很難從錯誤訊息看出來）。
-    """
+def _clean_folder_id(raw):
     raw = (raw or "").strip().strip('"').strip("'")
     if "/folders/" in raw:
         raw = raw.split("/folders/")[1]
@@ -67,17 +67,19 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 INBOX_NAME = "01_待處理"
 DONE_NAME = "02_完成"
 ARCHIVE_NAME = "03_已處理素材"
+MUSIC_NAME = "音樂"
+STICKER_NAME = "貼圖"
+STICKER_CATEGORIES = ["浮誇", "一般", "簡約"]
 
 MAX_BATCHES_PER_RUN = 8
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
-ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 
 
 # ============ 通知 ============
 
-def notify(message: str):
+def notify(message):
     print(message)
     if not DISCORD_WEBHOOK_URL:
         return
@@ -87,57 +89,43 @@ def notify(message: str):
         print(f"⚠️ Discord 通知發送失敗（不影響主流程）：{e}")
 
 
-# ============ Google Drive ============
+# ============ Drive ============
 
 def get_drive():
-    """服務帳戶的 Drive 連線：負責讀素材、建資料夾、搬資料夾。"""
-    creds = service_account.Credentials.from_service_account_file(
-        GOOGLE_KEY_PATH, scopes=SCOPES)
+    creds = service_account.Credentials.from_service_account_file(GOOGLE_KEY_PATH, scopes=SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 def get_user_drive():
-    """你本人 OAuth 的 Drive 連線：只負責上傳成品（吃你的 5TB）。
-
-    沒設定 OAuth 三個環境變數時回傳 None，上傳會退回服務帳戶
-    （這樣就算還沒設好 OAuth，其他功能也不會壞）。
-    """
     if not (OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REFRESH_TOKEN):
         return None
-    creds = UserCredentials(
-        token=None,
-        refresh_token=OAUTH_REFRESH_TOKEN,
-        client_id=OAUTH_CLIENT_ID,
-        client_secret=OAUTH_CLIENT_SECRET,
-        token_uri=OAUTH_TOKEN_URI,
-        scopes=SCOPES,
-    )
+    creds = UserCredentials(token=None, refresh_token=OAUTH_REFRESH_TOKEN,
+                            client_id=OAUTH_CLIENT_ID, client_secret=OAUTH_CLIENT_SECRET,
+                            token_uri=OAUTH_TOKEN_URI, scopes=SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def find_child(drive, parent_id: str, name: str, folder_only=True):
-    q = (f"'{parent_id}' in parents and name = '{name}' and trashed = false")
+def find_child(drive, parent_id, name, folder_only=True):
+    q = f"'{parent_id}' in parents and name = '{name}' and trashed = false"
     if folder_only:
         q += f" and mimeType = '{FOLDER_MIME}'"
-    res = drive.files().list(q=q, fields="files(id,name)",
-                             supportsAllDrives=True,
+    res = drive.files().list(q=q, fields="files(id,name)", supportsAllDrives=True,
                              includeItemsFromAllDrives=True).execute()
     files = res.get("files", [])
     return files[0]["id"] if files else None
 
 
-def list_children(drive, parent_id: str, folder_only=False):
+def list_children(drive, parent_id, folder_only=False):
     q = f"'{parent_id}' in parents and trashed = false"
     if folder_only:
         q += f" and mimeType = '{FOLDER_MIME}'"
-    res = drive.files().list(
-        q=q, fields="files(id,name,mimeType,createdTime)",
-        orderBy="createdTime", pageSize=200,
-        supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+    res = drive.files().list(q=q, fields="files(id,name,mimeType,createdTime)",
+                             orderBy="createdTime", pageSize=200, supportsAllDrives=True,
+                             includeItemsFromAllDrives=True).execute()
     return res.get("files", [])
 
 
-def download_file(drive, file_id: str, dest_path: str):
+def download_file(drive, file_id, dest_path):
     request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
     with open(dest_path, "wb") as f:
         downloader = MediaIoBaseDownload(f, request)
@@ -146,17 +134,15 @@ def download_file(drive, file_id: str, dest_path: str):
             _, done = downloader.next_chunk()
 
 
-def create_folder(drive, parent_id: str, name: str) -> str:
+def create_folder(drive, parent_id, name):
     existing = find_child(drive, parent_id, name)
     if existing:
         return existing
     meta = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
-    return drive.files().create(body=meta, fields="id",
-                                supportsAllDrives=True).execute()["id"]
+    return drive.files().create(body=meta, fields="id", supportsAllDrives=True).execute()["id"]
 
 
-def upload_file(drive, parent_id: str, local_path: str, mime="video/mp4",
-                using_oauth=False) -> str:
+def upload_file(drive, parent_id, local_path, mime="video/mp4", using_oauth=False):
     meta = {"name": os.path.basename(local_path), "parents": [parent_id]}
     media = MediaFileUpload(local_path, mimetype=mime, resumable=True)
     try:
@@ -165,28 +151,72 @@ def upload_file(drive, parent_id: str, local_path: str, mime="video/mp4",
     except Exception as e:
         if "storageQuotaExceeded" in str(e) or "quotaExceeded" in str(e):
             if using_oauth:
-                raise RuntimeError(
-                    "Drive 上傳被拒：你本人帳號的儲存空間也滿了。\n"
-                    "解法：清理你 Drive 裡的舊檔案（含清空垃圾桶）。") from e
+                raise RuntimeError("Drive 上傳被拒：你本人帳號的儲存空間也滿了。\n"
+                                   "解法：清理你 Drive 裡的舊檔案（含清空垃圾桶）。") from e
             raise RuntimeError(
-                "Drive 上傳被拒：服務帳戶自己的儲存空間額度用完了。\n"
-                "（服務帳戶上傳的檔案算它自己的額度，不是你的5TB，這是Google的規則）\n"
-                "看起來 OAuth 還沒設定好，所以退回用服務帳戶上傳。\n"
-                "請確認 OAUTH_CLIENT_ID／OAUTH_CLIENT_SECRET／OAUTH_REFRESH_TOKEN "
-                "三個 Secret 都設好了。") from e
+                "Drive 上傳被拒：服務帳戶自己的15GB用完了，而且看起來 OAuth 還沒設好。\n"
+                "請確認 OAUTH_CLIENT_ID／OAUTH_CLIENT_SECRET／OAUTH_REFRESH_TOKEN 都設定了。") from e
         raise
 
 
-def move_folder(drive, folder_id: str, new_parent_id: str, old_parent_id: str):
+def move_folder(drive, folder_id, new_parent_id, old_parent_id):
     drive.files().update(fileId=folder_id, addParents=new_parent_id,
                          removeParents=old_parent_id, fields="id",
                          supportsAllDrives=True).execute()
 
 
-# ============ 單一批次處理 ============
+# ============ 下載音樂與貼圖（整輪共用，只抓一次）============
 
-def classify_files(files: list) -> dict:
-    """依副檔名分類，使用者不用改檔名。"""
+def download_assets(drive, root_id, dest_dir):
+    """下載 Drive 的音樂＋三類貼圖到本機，回傳
+    (music_paths, {分類: [貼圖路徑,...]})。
+    資料夾不存在或空的都不會報錯，只是那項是空清單。"""
+    music_paths = []
+    music_id = find_child(drive, root_id, MUSIC_NAME)
+    if music_id:
+        md = os.path.join(dest_dir, "music")
+        os.makedirs(md, exist_ok=True)
+        for f in list_children(drive, music_id):
+            if f["mimeType"] == FOLDER_MIME:
+                continue
+            p = os.path.join(md, f["name"])
+            try:
+                download_file(drive, f["id"], p)
+                if render.is_readable(p):
+                    music_paths.append(p)
+                else:
+                    print(f"⚠️ 音樂「{f['name']}」壞檔或格式不對，跳過")
+            except Exception as e:
+                print(f"⚠️ 下載音樂「{f['name']}」失敗，跳過：{e}")
+
+    sticker_pools = {c: [] for c in STICKER_CATEGORIES}
+    sticker_root = find_child(drive, root_id, STICKER_NAME)
+    if sticker_root:
+        for cat in STICKER_CATEGORIES:
+            cat_id = find_child(drive, sticker_root, cat)
+            if not cat_id:
+                continue
+            cd = os.path.join(dest_dir, "stickers", cat)
+            os.makedirs(cd, exist_ok=True)
+            for f in list_children(drive, cat_id):
+                if f["mimeType"] == FOLDER_MIME:
+                    continue
+                p = os.path.join(cd, f["name"])
+                try:
+                    download_file(drive, f["id"], p)
+                    if render.is_readable(p):
+                        sticker_pools[cat].append(p)
+                    else:
+                        print(f"⚠️ 貼圖「{cat}/{f['name']}」壞檔，跳過")
+                except Exception as e:
+                    print(f"⚠️ 下載貼圖「{cat}/{f['name']}」失敗，跳過：{e}")
+
+    return music_paths, sticker_pools
+
+
+# ============ 單一批次 ============
+
+def classify_files(files):
     result = {"material": [], "voice": None, "script": None}
     for f in files:
         if f["mimeType"] == FOLDER_MIME:
@@ -202,19 +232,11 @@ def classify_files(files: list) -> dict:
 
 
 def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
-                  templates, good_assets) -> dict:
-    """處理一批素材，回傳結果摘要。
-
-    drive       ：服務帳戶連線，負責讀素材、搬資料夾
-    user_drive  ：你本人 OAuth 連線，負責建立成品資料夾＋上傳成品（吃你的5TB）。
-                  沒設定 OAuth 時是 None，會退回用服務帳戶上傳。
-    """
+                  templates, music_paths, sticker_pools):
     name = batch["name"]
     print(f"\n===== 處理批次「{name}」 =====")
     workdir = tempfile.mkdtemp(prefix="batch_")
     ok, failed = [], []
-
-    # 上傳端：有 OAuth 就用你本人帳號，沒有就退回服務帳戶
     up_drive = user_drive if user_drive is not None else drive
     using_oauth = user_drive is not None
 
@@ -247,31 +269,38 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
         print(f"素材正規化完成：{duration:.2f} 秒"
               f"（語音 {voice_dur:.2f} 秒，字幕 {len(subtitle_lines or [])} 句）")
 
-        # 成品資料夾用「上傳端」建立，讓資料夾跟裡面的檔案同屬一個擁有者，
-        # 避免服務帳戶建的資料夾、你本人帳號卻沒權限寫進去的錯亂
         out_folder_id = create_folder(up_drive, done_id, name)
 
         for tpl in templates:
-            out_path = os.path.join(workdir, f"{tpl['id']}_{name}.mp4")
+            wd = os.path.join(workdir, f"wd_{tpl['id']}")
+            os.makedirs(wd, exist_ok=True)
+            out_path = os.path.join(wd, f"{tpl['id']}_{name}.mp4")
             try:
                 t0 = time.time()
-                picked = render.apply_template(
-                    normalized, duration, tpl, ASSETS_DIR, out_path,
+                # 音樂隨機抽（沒音樂就無法做，報明確錯）
+                if not music_paths:
+                    raise RuntimeError("Drive「音樂」資料夾沒有可用音樂")
+                music = random.choice(music_paths)
+                # 貼圖：依模板分類抽 0~n 個（空分類自動變沒貼圖）
+                pool = sticker_pools.get(tpl.get("sticker_pool"), [])
+                stickers = render.pick_stickers(pool, tuple(tpl.get("sticker_count", [0, 0])))
+
+                info = render.apply_template(
+                    normalized, duration, tpl, out_path, music,
                     voice_path=voice_path, subtitle_lines=subtitle_lines,
-                    good_assets=good_assets)
+                    sticker_paths=stickers, workdir=wd)
                 upload_file(up_drive, out_folder_id, out_path, using_oauth=using_oauth)
-                os.remove(out_path)     # 上傳完就刪本地檔，免得暫存空間爆掉
-                print(f"  ✅ {tpl['id']} {tpl['name']}（{picked}，{time.time() - t0:.1f}s）")
+                print(f"  ✅ {tpl['id']} {tpl['name']}（{info}，{time.time()-t0:.1f}s）")
                 ok.append(tpl["id"])
             except Exception as e:
                 print(f"  ❌ {tpl['id']} {tpl['name']} 失敗：{e}")
                 failed.append(f"{tpl['id']}({type(e).__name__})")
+            finally:
+                shutil.rmtree(wd, ignore_errors=True)
 
         if ok:
             move_folder(drive, batch["id"], archive_id, inbox_id)
-
         return {"name": name, "ok": ok, "failed": failed, "duration": duration}
-
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -279,10 +308,8 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
 # ============ 主流程 ============
 
 def main():
-    missing = [k for k, v in {
-        "GOOGLE_SHEET_KEY_PATH": GOOGLE_KEY_PATH,
-        "DRIVE_ROOT_FOLDER_ID": DRIVE_ROOT_FOLDER_ID,
-    }.items() if not v]
+    missing = [k for k, v in {"GOOGLE_SHEET_KEY_PATH": GOOGLE_KEY_PATH,
+                              "DRIVE_ROOT_FOLDER_ID": DRIVE_ROOT_FOLDER_ID}.items() if not v]
     if missing:
         print(f"❌ 缺少環境變數：{', '.join(missing)}")
         sys.exit(1)
@@ -293,94 +320,32 @@ def main():
         sys.exit(1)
     print(f"已載入 {len(templates)} 個模板：{'、'.join(t['id'] for t in templates)}")
 
-    # 開跑前檢查每個模板要用的音樂/貼圖：
-    #   1. 檔案在不在
-    #   2. ffmpeg 讀不讀得動（擋「副檔名對但檔案壞掉/不是真的該格式」）
-    # 分兩種嚴重度：
-    #   缺檔／指定的檔案全壞 -> 這個模板沒救，直接停下來（missing）
-    #   清單裡有壞檔但還有好的 -> 只警告、把壞檔踢出隨機池，繼續跑（bad_but_ok）
-    good_assets = set()
-    missing = []          # 完全找不到，或某模板的音樂/某類貼圖「全部」都壞
-    bad_files = []        # 個別壞檔（清單裡還有其他好的可以頂替）
-
-    def check_pool(tid, kind, names):
-        """檢查一組候選檔案，回傳這組裡「好的」檔名清單。"""
-        good_here = []
-        for fn in names:
-            if not fn:
-                continue
-            path = os.path.join(ASSETS_DIR, fn)
-            if not os.path.exists(path):
-                bad_files.append(f"{tid} {kind}：assets/{fn} 不存在")
-            elif not render.is_readable(path):
-                bad_files.append(f"{tid} {kind}：assets/{fn} 壞檔或格式不對，ffmpeg 讀不動")
-            else:
-                good_here.append(fn)
-                good_assets.add(fn)
-        return good_here
-
-    for t in templates:
-        music_names = render.asset_candidates(t.get("music")) or [None]
-        good_music = check_pool(t["id"], "音樂", music_names)
-        if not good_music:
-            missing.append(f"{t['id']}：沒有任何一個音樂檔可用（music 欄位）")
-
-        if (t.get("sticker") or {}).get("enabled"):
-            sticker_names = render.asset_candidates(t["sticker"]["file"])
-            good_sticker = check_pool(t["id"], "貼圖", sticker_names)
-            if not good_sticker:
-                missing.append(f"{t['id']}：沒有任何一個貼圖檔可用（sticker.file）")
-
-    if missing:
-        have = sorted(os.listdir(ASSETS_DIR)) if os.path.isdir(ASSETS_DIR) else []
-        msg = ("❌ 有模板缺少必要素材，無法出片，先補齊再跑：\n  "
-               + "\n  ".join(missing))
-        if bad_files:
-            msg += "\n\n（另外偵測到這些壞檔）：\n  " + "\n  ".join(bad_files)
-        msg += (f"\n\n  assets 資料夾目前有：{'、'.join(have) if have else '（空的）'}"
-                "\n  音樂請準備可商用音檔上傳到 repo 的 assets/；"
-                "不想要貼圖就把模板 json 裡 sticker 的 enabled 改成 false。")
-        notify(msg)
-        sys.exit(1)
-
-    if bad_files:
-        # 有壞檔但每個模板都還有好的可用 -> 只提醒，不中斷
-        notify("⚠️ 偵測到壞檔，已自動跳過（不影響出片，但建議換掉）：\n  "
-               + "\n  ".join(bad_files))
-
     drive = get_drive()
 
-    # 開跑前先確認「根資料夾看得到」，不然後面的404錯誤訊息完全看不出原因
     with open(GOOGLE_KEY_PATH, encoding="utf-8") as f:
         sa_email = json.load(f).get("client_email", "(讀不到)")
     try:
-        root = drive.files().get(fileId=DRIVE_ROOT_FOLDER_ID,
-                                 fields="id,name,mimeType",
+        root = drive.files().get(fileId=DRIVE_ROOT_FOLDER_ID, fields="id,name,mimeType",
                                  supportsAllDrives=True).execute()
     except Exception as e:
         print("❌ 服務帳戶看不到你設定的根資料夾。")
-        print(f"   收到的資料夾ID：{DRIVE_ROOT_FOLDER_ID!r}（長度 {len(DRIVE_ROOT_FOLDER_ID)}）")
+        print(f"   資料夾ID：{DRIVE_ROOT_FOLDER_ID!r}（長度 {len(DRIVE_ROOT_FOLDER_ID)}）")
         print(f"   服務帳戶：{sa_email}")
-        print("   Drive 對「沒權限」跟「不存在」都回 404，所以請依序檢查：")
-        print("   1. 「自動剪片」資料夾有沒有共用給上面那個服務帳戶，權限是不是「編輯者」")
-        print("   2. 資料夾ID是不是只有網址 /folders/ 後面那一段（正常長度約33字元）")
-        print("   3. Google Drive API 是不是啟用在「服務帳戶所屬的那個專案」")
-        print(f"\n   原始錯誤：{e}")
+        print("   請確認：1.資料夾有共用給服務帳戶(編輯者) 2.ID正確 3.Drive API已啟用")
+        print(f"   原始錯誤：{e}")
         sys.exit(1)
-
     if root["mimeType"] != FOLDER_MIME:
         print(f"❌ 這個ID指到的是檔案不是資料夾：{root['name']}")
         sys.exit(1)
     print(f"根資料夾確認：「{root['name']}」")
 
-    # 建立你本人 OAuth 的上傳連線（成品吃你的5TB）。沒設定就 None，退回服務帳戶。
     user_drive = get_user_drive()
     if user_drive is not None:
         try:
             user_drive.files().get(fileId=DRIVE_ROOT_FOLDER_ID, fields="id").execute()
             print("上傳身分：你本人帳號（成品算你的 5TB）")
         except Exception as e:
-            print(f"⚠️ OAuth 連線建立了但看不到根資料夾，退回用服務帳戶上傳。原因：{e}")
+            print(f"⚠️ OAuth 連線建立了但看不到根資料夾，退回服務帳戶上傳。原因：{e}")
             user_drive = None
     else:
         print("上傳身分：服務帳戶（⚠️ 只有15GB，OAuth 尚未設定）")
@@ -390,7 +355,7 @@ def main():
     archive_id = find_child(drive, DRIVE_ROOT_FOLDER_ID, ARCHIVE_NAME)
     for nm, fid in [(INBOX_NAME, inbox_id), (DONE_NAME, done_id), (ARCHIVE_NAME, archive_id)]:
         if not fid:
-            print(f"❌ 在根資料夾底下找不到「{nm}」資料夾，請先建好（名稱要一字不差）")
+            print(f"❌ 根資料夾底下找不到「{nm}」，請先建好（名稱一字不差）")
             sys.exit(1)
 
     batches = list_children(drive, inbox_id, folder_only=True)
@@ -398,18 +363,31 @@ def main():
         print("待處理資料夾是空的，這次沒事做。")
         return
 
-    todo = batches[:MAX_BATCHES_PER_RUN]
-    print(f"待處理 {len(batches)} 批，本次處理 {len(todo)} 批。")
+    todo_count = 0
+    asset_dir = tempfile.mkdtemp(prefix="assets_")
+    try:
+        print("下載音樂與貼圖中...")
+        music_paths, sticker_pools = download_assets(drive, DRIVE_ROOT_FOLDER_ID, asset_dir)
+        pool_summary = "、".join(f"{c}:{len(sticker_pools[c])}張" for c in STICKER_CATEGORIES)
+        print(f"音樂 {len(music_paths)} 首｜貼圖 {pool_summary}")
+        if not music_paths:
+            notify("❌ Drive「音樂」資料夾沒有可用音樂，無法出片。請上傳可商用音檔到「自動剪片/音樂/」。")
+            return
 
-    results = []
-    for b in todo:
-        try:
-            results.append(process_batch(drive, user_drive, b, inbox_id, done_id,
-                                         archive_id, templates, good_assets))
-        except Exception as e:
-            traceback.print_exc()
-            results.append({"name": b["name"], "ok": [], "failed": [f"整批失敗：{e}"],
-                            "duration": 0})
+        todo = batches[:MAX_BATCHES_PER_RUN]
+        todo_count = len(todo)
+        print(f"待處理 {len(batches)} 批，本次處理 {todo_count} 批。")
+
+        results = []
+        for b in todo:
+            try:
+                results.append(process_batch(drive, user_drive, b, inbox_id, done_id,
+                                             archive_id, templates, music_paths, sticker_pools))
+            except Exception as e:
+                traceback.print_exc()
+                results.append({"name": b["name"], "ok": [], "failed": [f"整批失敗：{e}"], "duration": 0})
+    finally:
+        shutil.rmtree(asset_dir, ignore_errors=True)
 
     lines = ["🎬 **自動剪片完成**"]
     for r in results:
@@ -417,7 +395,7 @@ def main():
         if r["failed"]:
             status += f"　❌ 失敗：{', '.join(r['failed'])}"
         lines.append(f"・`{r['name']}`（{r['duration']:.1f}秒）→ {status}")
-    remaining = len(batches) - len(todo)
+    remaining = len(batches) - todo_count
     if remaining > 0:
         lines.append(f"\n還有 {remaining} 批排隊中，下一輪會繼續處理。")
     lines.append("成品在 Drive 的「02_完成」，記得下載完刪掉。")
