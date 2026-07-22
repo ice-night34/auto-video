@@ -28,6 +28,7 @@ import traceback
 
 import requests
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
@@ -35,6 +36,13 @@ import render
 
 GOOGLE_KEY_PATH = (os.environ.get("GOOGLE_SHEET_KEY_PATH") or "").strip()
 DISCORD_WEBHOOK_URL = (os.environ.get("DISCORD_WEBHOOK_URL") or "").strip()
+
+# 上傳成品用「你本人」的 OAuth 授權（吃你的 5TB），其他讀寫維持服務帳戶。
+# 這三個值由本機跑一次 get_token.py 取得後，存進 GitHub Secrets。
+OAUTH_CLIENT_ID = (os.environ.get("OAUTH_CLIENT_ID") or "").strip()
+OAUTH_CLIENT_SECRET = (os.environ.get("OAUTH_CLIENT_SECRET") or "").strip()
+OAUTH_REFRESH_TOKEN = (os.environ.get("OAUTH_REFRESH_TOKEN") or "").strip()
+OAUTH_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 
 def _clean_folder_id(raw: str) -> str:
@@ -82,8 +90,28 @@ def notify(message: str):
 # ============ Google Drive ============
 
 def get_drive():
+    """服務帳戶的 Drive 連線：負責讀素材、建資料夾、搬資料夾。"""
     creds = service_account.Credentials.from_service_account_file(
         GOOGLE_KEY_PATH, scopes=SCOPES)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def get_user_drive():
+    """你本人 OAuth 的 Drive 連線：只負責上傳成品（吃你的 5TB）。
+
+    沒設定 OAuth 三個環境變數時回傳 None，上傳會退回服務帳戶
+    （這樣就算還沒設好 OAuth，其他功能也不會壞）。
+    """
+    if not (OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REFRESH_TOKEN):
+        return None
+    creds = UserCredentials(
+        token=None,
+        refresh_token=OAUTH_REFRESH_TOKEN,
+        client_id=OAUTH_CLIENT_ID,
+        client_secret=OAUTH_CLIENT_SECRET,
+        token_uri=OAUTH_TOKEN_URI,
+        scopes=SCOPES,
+    )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -127,7 +155,8 @@ def create_folder(drive, parent_id: str, name: str) -> str:
                                 supportsAllDrives=True).execute()["id"]
 
 
-def upload_file(drive, parent_id: str, local_path: str, mime="video/mp4") -> str:
+def upload_file(drive, parent_id: str, local_path: str, mime="video/mp4",
+                using_oauth=False) -> str:
     meta = {"name": os.path.basename(local_path), "parents": [parent_id]}
     media = MediaFileUpload(local_path, mimetype=mime, resumable=True)
     try:
@@ -135,11 +164,16 @@ def upload_file(drive, parent_id: str, local_path: str, mime="video/mp4") -> str
                                     supportsAllDrives=True).execute()["id"]
     except Exception as e:
         if "storageQuotaExceeded" in str(e) or "quotaExceeded" in str(e):
+            if using_oauth:
+                raise RuntimeError(
+                    "Drive 上傳被拒：你本人帳號的儲存空間也滿了。\n"
+                    "解法：清理你 Drive 裡的舊檔案（含清空垃圾桶）。") from e
             raise RuntimeError(
                 "Drive 上傳被拒：服務帳戶自己的儲存空間額度用完了。\n"
-                "（服務帳戶上傳的檔案算在它自己的額度，不是算你的5TB，這是Google的規則）\n"
-                "解法：把「02_完成」裡的舊成品刪掉並清空垃圾桶；"
-                "如果常常滿，就要改成用你本人帳號的 OAuth 授權。") from e
+                "（服務帳戶上傳的檔案算它自己的額度，不是你的5TB，這是Google的規則）\n"
+                "看起來 OAuth 還沒設定好，所以退回用服務帳戶上傳。\n"
+                "請確認 OAUTH_CLIENT_ID／OAUTH_CLIENT_SECRET／OAUTH_REFRESH_TOKEN "
+                "三個 Secret 都設好了。") from e
         raise
 
 
@@ -167,12 +201,22 @@ def classify_files(files: list) -> dict:
     return result
 
 
-def process_batch(drive, batch, inbox_id, done_id, archive_id, templates, good_assets) -> dict:
-    """處理一批素材，回傳結果摘要。"""
+def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
+                  templates, good_assets) -> dict:
+    """處理一批素材，回傳結果摘要。
+
+    drive       ：服務帳戶連線，負責讀素材、搬資料夾
+    user_drive  ：你本人 OAuth 連線，負責建立成品資料夾＋上傳成品（吃你的5TB）。
+                  沒設定 OAuth 時是 None，會退回用服務帳戶上傳。
+    """
     name = batch["name"]
     print(f"\n===== 處理批次「{name}」 =====")
     workdir = tempfile.mkdtemp(prefix="batch_")
     ok, failed = [], []
+
+    # 上傳端：有 OAuth 就用你本人帳號，沒有就退回服務帳戶
+    up_drive = user_drive if user_drive is not None else drive
+    using_oauth = user_drive is not None
 
     try:
         files = list_children(drive, batch["id"])
@@ -203,7 +247,9 @@ def process_batch(drive, batch, inbox_id, done_id, archive_id, templates, good_a
         print(f"素材正規化完成：{duration:.2f} 秒"
               f"（語音 {voice_dur:.2f} 秒，字幕 {len(subtitle_lines or [])} 句）")
 
-        out_folder_id = create_folder(drive, done_id, name)
+        # 成品資料夾用「上傳端」建立，讓資料夾跟裡面的檔案同屬一個擁有者，
+        # 避免服務帳戶建的資料夾、你本人帳號卻沒權限寫進去的錯亂
+        out_folder_id = create_folder(up_drive, done_id, name)
 
         for tpl in templates:
             out_path = os.path.join(workdir, f"{tpl['id']}_{name}.mp4")
@@ -213,7 +259,7 @@ def process_batch(drive, batch, inbox_id, done_id, archive_id, templates, good_a
                     normalized, duration, tpl, ASSETS_DIR, out_path,
                     voice_path=voice_path, subtitle_lines=subtitle_lines,
                     good_assets=good_assets)
-                upload_file(drive, out_folder_id, out_path)
+                upload_file(up_drive, out_folder_id, out_path, using_oauth=using_oauth)
                 os.remove(out_path)     # 上傳完就刪本地檔，免得暫存空間爆掉
                 print(f"  ✅ {tpl['id']} {tpl['name']}（{picked}，{time.time() - t0:.1f}s）")
                 ok.append(tpl["id"])
@@ -327,6 +373,18 @@ def main():
         sys.exit(1)
     print(f"根資料夾確認：「{root['name']}」")
 
+    # 建立你本人 OAuth 的上傳連線（成品吃你的5TB）。沒設定就 None，退回服務帳戶。
+    user_drive = get_user_drive()
+    if user_drive is not None:
+        try:
+            user_drive.files().get(fileId=DRIVE_ROOT_FOLDER_ID, fields="id").execute()
+            print("上傳身分：你本人帳號（成品算你的 5TB）")
+        except Exception as e:
+            print(f"⚠️ OAuth 連線建立了但看不到根資料夾，退回用服務帳戶上傳。原因：{e}")
+            user_drive = None
+    else:
+        print("上傳身分：服務帳戶（⚠️ 只有15GB，OAuth 尚未設定）")
+
     inbox_id = find_child(drive, DRIVE_ROOT_FOLDER_ID, INBOX_NAME)
     done_id = find_child(drive, DRIVE_ROOT_FOLDER_ID, DONE_NAME)
     archive_id = find_child(drive, DRIVE_ROOT_FOLDER_ID, ARCHIVE_NAME)
@@ -346,7 +404,8 @@ def main():
     results = []
     for b in todo:
         try:
-            results.append(process_batch(drive, b, inbox_id, done_id, archive_id, templates, good_assets))
+            results.append(process_batch(drive, user_drive, b, inbox_id, done_id,
+                                         archive_id, templates, good_assets))
         except Exception as e:
             traceback.print_exc()
             results.append({"name": b["name"], "ok": [], "failed": [f"整批失敗：{e}"],
