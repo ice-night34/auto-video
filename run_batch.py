@@ -167,7 +167,7 @@ def classify_files(files: list) -> dict:
     return result
 
 
-def process_batch(drive, batch, inbox_id, done_id, archive_id, templates) -> dict:
+def process_batch(drive, batch, inbox_id, done_id, archive_id, templates, good_assets) -> dict:
     """處理一批素材，回傳結果摘要。"""
     name = batch["name"]
     print(f"\n===== 處理批次「{name}」 =====")
@@ -346,7 +346,7 @@ def main():
     results = []
     for b in todo:
         try:
-            results.append(process_batch(drive, b, inbox_id, done_id, archive_id, templates))
+            results.append(process_batch(drive, b, inbox_id, done_id, archive_id, templates, good_assets))
         except Exception as e:
             traceback.print_exc()
             results.append({"name": b["name"], "ok": [], "failed": [f"整批失敗：{e}"],
