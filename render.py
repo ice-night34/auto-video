@@ -60,6 +60,21 @@ def probe_duration(path: str) -> float:
         raise RuntimeError(f"無法讀取檔案長度，可能不是有效的影音檔：{path}")
 
 
+def is_readable(path: str) -> bool:
+    """用 ffprobe 確認這個檔案 ffmpeg 讀不讀得動。
+    專門擋「副檔名是 .mp3 但其實不是 mp3」「上傳到一半的壞檔」這種——
+    播放器能容錯播放，但 ffmpeg 會因為檔案結構不對而失敗。
+    """
+    if not os.path.exists(path):
+        return False
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=format_name",
+         "-of", "csv=p=0", path],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 # ============ 第一段：素材正規化 ============
 
 def plan_video(src_duration: float, voice_duration: float = 0.0) -> dict:
@@ -184,8 +199,9 @@ def read_script_lines(path: str) -> list:
 # ============ 第二段：套模板 ============
 
 def apply_template(normalized: str, duration: float, template: dict, assets_dir: str,
-                   out_path: str, voice_path: str = None, subtitle_lines: list = None):
-    music_file = pick_asset(template["music"])
+                   out_path: str, voice_path: str = None, subtitle_lines: list = None,
+                   good_assets: set = None):
+    music_file = pick_asset(template["music"], assets_dir, good_assets)
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", normalized]
     cmd += ["-stream_loop", "-1", "-i", os.path.join(assets_dir, music_file)]
     idx = 2
@@ -196,7 +212,7 @@ def apply_template(normalized: str, duration: float, template: dict, assets_dir:
     if sticker.get("enabled"):
         # 靜態PNG只有一格畫面，要用 -loop 1 讓它變成連續影格，
         # 否則淡入效果沒有時間軸可走，會整張透明（實際踩過這個坑）
-        sticker_file = pick_asset(sticker["file"])
+        sticker_file = pick_asset(sticker["file"], assets_dir, good_assets)
         cmd += ["-loop", "1", "-i", os.path.join(assets_dir, sticker_file)]
         picked.append(f"貼圖 {sticker_file}")
         sticker_idx = idx
@@ -277,14 +293,21 @@ def apply_template(normalized: str, duration: float, template: dict, assets_dir:
     return "、".join(picked)
 
 
-def pick_asset(value) -> str:
+def pick_asset(value, assets_dir: str = None, good_names: set = None) -> str:
     """模板裡的音樂/貼圖欄位可以寫「單一檔名」或「檔名清單」。
     寫清單時每次渲染隨機抽一個，讓同一個模板出來的影片不會每支都一模一樣
     （一天大量出片時，降低內容雷同度）。
+
+    good_names 有傳的話，只會從「驗證過讀得動」的檔案裡抽，
+    自動跳過壞檔（壞檔頂多不被抽中，不會害這支影片失敗）。
     """
-    if isinstance(value, list):
-        return random.choice(value)
-    return value
+    candidates = value if isinstance(value, list) else [value]
+    if good_names is not None:
+        usable = [c for c in candidates if c in good_names]
+        if usable:
+            candidates = usable
+        # 全部都是壞檔的極端情況：還是回傳原始第一個，讓它照常報錯（不會靜默出錯片）
+    return random.choice(candidates)
 
 
 def asset_candidates(value) -> list:
