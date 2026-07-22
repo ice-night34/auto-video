@@ -23,6 +23,7 @@
 
 import json
 import os
+import random
 import subprocess
 
 W, H, FPS = 1080, 1920, 30
@@ -184,16 +185,20 @@ def read_script_lines(path: str) -> list:
 
 def apply_template(normalized: str, duration: float, template: dict, assets_dir: str,
                    out_path: str, voice_path: str = None, subtitle_lines: list = None):
+    music_file = pick_asset(template["music"])
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", normalized]
-    cmd += ["-stream_loop", "-1", "-i", os.path.join(assets_dir, template["music"])]
+    cmd += ["-stream_loop", "-1", "-i", os.path.join(assets_dir, music_file)]
     idx = 2
+    picked = [f"音樂 {music_file}"]
 
     sticker = template.get("sticker") or {}
     sticker_idx = None
     if sticker.get("enabled"):
         # 靜態PNG只有一格畫面，要用 -loop 1 讓它變成連續影格，
         # 否則淡入效果沒有時間軸可走，會整張透明（實際踩過這個坑）
-        cmd += ["-loop", "1", "-i", os.path.join(assets_dir, sticker["file"])]
+        sticker_file = pick_asset(sticker["file"])
+        cmd += ["-loop", "1", "-i", os.path.join(assets_dir, sticker_file)]
+        picked.append(f"貼圖 {sticker_file}")
         sticker_idx = idx
         idx += 1
 
@@ -269,6 +274,24 @@ def apply_template(normalized: str, duration: float, template: dict, assets_dir:
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart", out_path]
     run(cmd)
+    return "、".join(picked)
+
+
+def pick_asset(value) -> str:
+    """模板裡的音樂/貼圖欄位可以寫「單一檔名」或「檔名清單」。
+    寫清單時每次渲染隨機抽一個，讓同一個模板出來的影片不會每支都一模一樣
+    （一天大量出片時，降低內容雷同度）。
+    """
+    if isinstance(value, list):
+        return random.choice(value)
+    return value
+
+
+def asset_candidates(value) -> list:
+    """回傳這個欄位「所有可能用到」的檔名，給開跑前的檔案檢查用。"""
+    if isinstance(value, list):
+        return list(value)
+    return [value] if value else []
 
 
 def load_templates(templates_dir: str) -> list:
