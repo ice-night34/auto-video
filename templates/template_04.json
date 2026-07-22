@@ -1,12 +1,7 @@
 {
-  "id": "T01",
-  "name": "柔和放大",
-  "opening": "zoom_in",
-  "zoom": {
-    "from": 1.0,
-    "to": 1.15
-  },
-  "corner_light": "top_left",
+  "id": "T04",
+  "name": "時間錯位",
+  "opening": "time_shuffle",
   "end_fade_out": 0.5,
   "sticker_pool": "一般",
   "sticker_count": [
@@ -15,16 +10,16 @@
   ],
   "sticker_motion": [
     "enter",
-    "float"
+    "cross"
   ],
   "subtitle_style": {
     "font": "Noto Sans CJK TC",
     "size": 64,
     "bold": 1,
     "primary_colour": "&H00FFFFFF",
-    "outline_colour": "&H00000000",
+    "outline_colour": "&H000000FF",
     "outline": 4,
-    "margin_v": 260,
-    "alignment": 2
+    "margin_v": 300,
+    "alignment": 1
   }
 }

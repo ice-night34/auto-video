@@ -1,12 +1,7 @@
 {
-  "id": "T01",
-  "name": "柔和放大",
-  "opening": "zoom_in",
-  "zoom": {
-    "from": 1.0,
-    "to": 1.15
-  },
-  "corner_light": "top_left",
+  "id": "T06",
+  "name": "倒放開場",
+  "opening": "reverse",
   "end_fade_out": 0.5,
   "sticker_pool": "一般",
   "sticker_count": [
@@ -19,11 +14,11 @@
   ],
   "subtitle_style": {
     "font": "Noto Sans CJK TC",
-    "size": 64,
+    "size": 72,
     "bold": 1,
-    "primary_colour": "&H00FFFFFF",
+    "primary_colour": "&H0000FFFF",
     "outline_colour": "&H00000000",
-    "outline": 4,
+    "outline": 5,
     "margin_v": 260,
     "alignment": 2
   }
