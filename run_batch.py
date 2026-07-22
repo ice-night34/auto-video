@@ -18,6 +18,7 @@
   DISCORD_WEBHOOK_URL     Discord 通知用的 webhook 網址
 """
 
+import json
 import os
 import shutil
 import sys
@@ -32,9 +33,25 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 import render
 
-GOOGLE_KEY_PATH = os.environ.get("GOOGLE_SHEET_KEY_PATH")
-DRIVE_ROOT_FOLDER_ID = os.environ.get("DRIVE_ROOT_FOLDER_ID")
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+GOOGLE_KEY_PATH = (os.environ.get("GOOGLE_SHEET_KEY_PATH") or "").strip()
+DISCORD_WEBHOOK_URL = (os.environ.get("DISCORD_WEBHOOK_URL") or "").strip()
+
+
+def _clean_folder_id(raw: str) -> str:
+    """把使用者可能貼錯的格式清成純資料夾ID。
+
+    常見貼錯：整條網址、尾巴帶 ?usp=drive_link、前後有空白或換行
+    （GitHub Secrets 會原封不動保留空白，這種錯誤很難從錯誤訊息看出來）。
+    """
+    raw = (raw or "").strip().strip('"').strip("'")
+    if "/folders/" in raw:
+        raw = raw.split("/folders/")[1]
+    if "?" in raw:
+        raw = raw.split("?")[0]
+    return raw.strip("/ ").strip()
+
+
+DRIVE_ROOT_FOLDER_ID = _clean_folder_id(os.environ.get("DRIVE_ROOT_FOLDER_ID"))
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -192,12 +209,12 @@ def process_batch(drive, batch, inbox_id, done_id, archive_id, templates) -> dic
             out_path = os.path.join(workdir, f"{tpl['id']}_{name}.mp4")
             try:
                 t0 = time.time()
-                render.apply_template(
+                picked = render.apply_template(
                     normalized, duration, tpl, ASSETS_DIR, out_path,
                     voice_path=voice_path, subtitle_lines=subtitle_lines)
                 upload_file(drive, out_folder_id, out_path)
                 os.remove(out_path)     # 上傳完就刪本地檔，免得暫存空間爆掉
-                print(f"  ✅ {tpl['id']} {tpl['name']}（{time.time() - t0:.1f}s）")
+                print(f"  ✅ {tpl['id']} {tpl['name']}（{picked}，{time.time() - t0:.1f}s）")
                 ok.append(tpl["id"])
             except Exception as e:
                 print(f"  ❌ {tpl['id']} {tpl['name']} 失敗：{e}")
@@ -229,7 +246,55 @@ def main():
         sys.exit(1)
     print(f"已載入 {len(templates)} 個模板：{'、'.join(t['id'] for t in templates)}")
 
+    # 開跑前先確認每個模板要用的音樂/貼圖都在 assets 裡。
+    # 不檢查的話，要等下載完素材、渲染到一半才會失敗，錯誤訊息也不好懂。
+    asset_problems = []
+    for t in templates:
+        needed = render.asset_candidates(t.get("music"))
+        if not needed:
+            needed = [None]
+        if (t.get("sticker") or {}).get("enabled"):
+            needed += render.asset_candidates(t["sticker"]["file"])
+        for fn in needed:
+            if not fn:
+                asset_problems.append(f"{t['id']}：沒有指定音樂檔（music 欄位）")
+            elif not os.path.exists(os.path.join(ASSETS_DIR, fn)):
+                asset_problems.append(f"{t['id']}：找不到 assets/{fn}")
+    if asset_problems:
+        have = sorted(os.listdir(ASSETS_DIR)) if os.path.isdir(ASSETS_DIR) else []
+        msg = ("❌ 模板要用的素材檔案不齊，先補齊再跑：\n  "
+               + "\n  ".join(asset_problems)
+               + f"\n\n  assets 資料夾目前有：{'、'.join(have) if have else '（空的）'}"
+               + "\n  音樂請自己準備可商用的音檔上傳到 repo 的 assets/；"
+                 "不想要貼圖就把模板 json 裡 sticker 的 enabled 改成 false。")
+        notify(msg)
+        sys.exit(1)
+
     drive = get_drive()
+
+    # 開跑前先確認「根資料夾看得到」，不然後面的404錯誤訊息完全看不出原因
+    with open(GOOGLE_KEY_PATH, encoding="utf-8") as f:
+        sa_email = json.load(f).get("client_email", "(讀不到)")
+    try:
+        root = drive.files().get(fileId=DRIVE_ROOT_FOLDER_ID,
+                                 fields="id,name,mimeType",
+                                 supportsAllDrives=True).execute()
+    except Exception as e:
+        print("❌ 服務帳戶看不到你設定的根資料夾。")
+        print(f"   收到的資料夾ID：{DRIVE_ROOT_FOLDER_ID!r}（長度 {len(DRIVE_ROOT_FOLDER_ID)}）")
+        print(f"   服務帳戶：{sa_email}")
+        print("   Drive 對「沒權限」跟「不存在」都回 404，所以請依序檢查：")
+        print("   1. 「自動剪片」資料夾有沒有共用給上面那個服務帳戶，權限是不是「編輯者」")
+        print("   2. 資料夾ID是不是只有網址 /folders/ 後面那一段（正常長度約33字元）")
+        print("   3. Google Drive API 是不是啟用在「服務帳戶所屬的那個專案」")
+        print(f"\n   原始錯誤：{e}")
+        sys.exit(1)
+
+    if root["mimeType"] != FOLDER_MIME:
+        print(f"❌ 這個ID指到的是檔案不是資料夾：{root['name']}")
+        sys.exit(1)
+    print(f"根資料夾確認：「{root['name']}」")
+
     inbox_id = find_child(drive, DRIVE_ROOT_FOLDER_ID, INBOX_NAME)
     done_id = find_child(drive, DRIVE_ROOT_FOLDER_ID, DONE_NAME)
     archive_id = find_child(drive, DRIVE_ROOT_FOLDER_ID, ARCHIVE_NAME)
