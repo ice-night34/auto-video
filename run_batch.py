@@ -211,7 +211,8 @@ def process_batch(drive, batch, inbox_id, done_id, archive_id, templates) -> dic
                 t0 = time.time()
                 picked = render.apply_template(
                     normalized, duration, tpl, ASSETS_DIR, out_path,
-                    voice_path=voice_path, subtitle_lines=subtitle_lines)
+                    voice_path=voice_path, subtitle_lines=subtitle_lines,
+                    good_assets=good_assets)
                 upload_file(drive, out_folder_id, out_path)
                 os.remove(out_path)     # 上傳完就刪本地檔，免得暫存空間爆掉
                 print(f"  ✅ {tpl['id']} {tpl['name']}（{picked}，{time.time() - t0:.1f}s）")
@@ -246,29 +247,60 @@ def main():
         sys.exit(1)
     print(f"已載入 {len(templates)} 個模板：{'、'.join(t['id'] for t in templates)}")
 
-    # 開跑前先確認每個模板要用的音樂/貼圖都在 assets 裡。
-    # 不檢查的話，要等下載完素材、渲染到一半才會失敗，錯誤訊息也不好懂。
-    asset_problems = []
-    for t in templates:
-        needed = render.asset_candidates(t.get("music"))
-        if not needed:
-            needed = [None]
-        if (t.get("sticker") or {}).get("enabled"):
-            needed += render.asset_candidates(t["sticker"]["file"])
-        for fn in needed:
+    # 開跑前檢查每個模板要用的音樂/貼圖：
+    #   1. 檔案在不在
+    #   2. ffmpeg 讀不讀得動（擋「副檔名對但檔案壞掉/不是真的該格式」）
+    # 分兩種嚴重度：
+    #   缺檔／指定的檔案全壞 -> 這個模板沒救，直接停下來（missing）
+    #   清單裡有壞檔但還有好的 -> 只警告、把壞檔踢出隨機池，繼續跑（bad_but_ok）
+    good_assets = set()
+    missing = []          # 完全找不到，或某模板的音樂/某類貼圖「全部」都壞
+    bad_files = []        # 個別壞檔（清單裡還有其他好的可以頂替）
+
+    def check_pool(tid, kind, names):
+        """檢查一組候選檔案，回傳這組裡「好的」檔名清單。"""
+        good_here = []
+        for fn in names:
             if not fn:
-                asset_problems.append(f"{t['id']}：沒有指定音樂檔（music 欄位）")
-            elif not os.path.exists(os.path.join(ASSETS_DIR, fn)):
-                asset_problems.append(f"{t['id']}：找不到 assets/{fn}")
-    if asset_problems:
+                continue
+            path = os.path.join(ASSETS_DIR, fn)
+            if not os.path.exists(path):
+                bad_files.append(f"{tid} {kind}：assets/{fn} 不存在")
+            elif not render.is_readable(path):
+                bad_files.append(f"{tid} {kind}：assets/{fn} 壞檔或格式不對，ffmpeg 讀不動")
+            else:
+                good_here.append(fn)
+                good_assets.add(fn)
+        return good_here
+
+    for t in templates:
+        music_names = render.asset_candidates(t.get("music")) or [None]
+        good_music = check_pool(t["id"], "音樂", music_names)
+        if not good_music:
+            missing.append(f"{t['id']}：沒有任何一個音樂檔可用（music 欄位）")
+
+        if (t.get("sticker") or {}).get("enabled"):
+            sticker_names = render.asset_candidates(t["sticker"]["file"])
+            good_sticker = check_pool(t["id"], "貼圖", sticker_names)
+            if not good_sticker:
+                missing.append(f"{t['id']}：沒有任何一個貼圖檔可用（sticker.file）")
+
+    if missing:
         have = sorted(os.listdir(ASSETS_DIR)) if os.path.isdir(ASSETS_DIR) else []
-        msg = ("❌ 模板要用的素材檔案不齊，先補齊再跑：\n  "
-               + "\n  ".join(asset_problems)
-               + f"\n\n  assets 資料夾目前有：{'、'.join(have) if have else '（空的）'}"
-               + "\n  音樂請自己準備可商用的音檔上傳到 repo 的 assets/；"
-                 "不想要貼圖就把模板 json 裡 sticker 的 enabled 改成 false。")
+        msg = ("❌ 有模板缺少必要素材，無法出片，先補齊再跑：\n  "
+               + "\n  ".join(missing))
+        if bad_files:
+            msg += "\n\n（另外偵測到這些壞檔）：\n  " + "\n  ".join(bad_files)
+        msg += (f"\n\n  assets 資料夾目前有：{'、'.join(have) if have else '（空的）'}"
+                "\n  音樂請準備可商用音檔上傳到 repo 的 assets/；"
+                "不想要貼圖就把模板 json 裡 sticker 的 enabled 改成 false。")
         notify(msg)
         sys.exit(1)
+
+    if bad_files:
+        # 有壞檔但每個模板都還有好的可用 -> 只提醒，不中斷
+        notify("⚠️ 偵測到壞檔，已自動跳過（不影響出片，但建議換掉）：\n  "
+               + "\n  ".join(bad_files))
 
     drive = get_drive()
 
