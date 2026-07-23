@@ -511,4 +511,27 @@ def apply_template(normalized, duration, template, out_path, music_path,
                    f"afade=t=out:st={fade_st}:d={MUSIC_FADE_OUT}[music]")
     if voice_idx is not None:
         filters.append(f"[{voice_idx}:a]aresample=44100[voice]")
-     
+        filters.append("[music][voice]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]")
+        aout = "[aout]"
+    else:
+        aout = "[music]"
+
+    cmd += ["-filter_complex", ";".join(filters), "-map", last, "-map", aout,
+            "-t", str(duration), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", out_path]
+    run(cmd, step=f"{template['id']} 合成輸出")
+
+    picked = [f"開頭 {opening}", f"音樂 {os.path.basename(music_path)}"]
+    if sticker_indices:
+        picked.append(f"貼圖 {len(sticker_indices)}張")
+    return "、".join(picked)
+
+
+def load_templates(templates_dir):
+    files = sorted(f for f in os.listdir(templates_dir) if f.endswith(".json"))
+    out = []
+    for f in files:
+        with open(os.path.join(templates_dir, f), encoding="utf-8") as fp:
+            out.append(json.load(fp))
+    return out
