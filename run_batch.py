@@ -28,6 +28,7 @@
 import json
 import os
 import random
+import socket
 import shutil
 import sys
 import tempfile
@@ -41,6 +42,20 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 import render
+
+# ⚠️ 關鍵：Google API 套件預設「沒有逾時」，連線卡住會無限等下去
+# （實際發生過：卡在連 Drive 34分鐘完全沒有任何輸出）。
+# 設一個全域上限，超過就丟錯誤，不會再無聲卡死。
+socket.setdefaulttimeout(90)
+
+_T0 = time.time()
+
+
+def log(msg):
+    """帶經過時間的即時輸出。flush=True 很重要——
+    GitHub Actions 的畫面是靠即時輸出更新的，沒有 flush 會全部卡在緩衝區裡，
+    看起來就像「程式沒動」，其實只是訊息還沒被吐出來。"""
+    print(f"[{time.time()-_T0:6.1f}s] {msg}", flush=True)
 
 GOOGLE_KEY_PATH = (os.environ.get("GOOGLE_SHEET_KEY_PATH") or "").strip()
 DISCORD_WEBHOOK_URL = (os.environ.get("DISCORD_WEBHOOK_URL") or "").strip()
@@ -234,7 +249,7 @@ def classify_files(files):
 def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
                   templates, music_paths, sticker_pools):
     name = batch["name"]
-    print(f"\n===== 處理批次「{name}」 =====")
+    log(f"===== 處理批次「{name}」 =====")
     workdir = tempfile.mkdtemp(prefix="batch_")
     ok, failed = [], []
     up_drive = user_drive if user_drive is not None else drive
@@ -246,6 +261,7 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
         if not cls["material"]:
             raise RuntimeError("資料夾裡沒有影片或照片素材")
 
+        log(f"下載素材 {len(cls['material'])} 個檔案...")
         local_material = []
         for f in cls["material"]:
             p = os.path.join(workdir, f["name"])
@@ -263,11 +279,12 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
             download_file(drive, cls["script"]["id"], sp)
             subtitle_lines = render.read_script_lines(sp)
 
+        log("素材下載完成，開始正規化...")
         voice_dur = render.probe_duration(voice_path) if voice_path else 0.0
         normalized = os.path.join(workdir, "_normalized.mp4")
         duration = render.normalize_material(local_material, normalized, voice_dur)
-        print(f"素材正規化完成：{duration:.2f} 秒"
-              f"（語音 {voice_dur:.2f} 秒，字幕 {len(subtitle_lines or [])} 句）")
+        log(f"正規化完成：{duration:.2f} 秒"
+            f"（語音 {voice_dur:.2f} 秒，字幕 {len(subtitle_lines or [])} 句）")
 
         out_folder_id = create_folder(up_drive, done_id, name)
 
@@ -277,6 +294,7 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
             out_path = os.path.join(wd, f"{tpl['id']}_{name}.mp4")
             try:
                 t0 = time.time()
+                log(f"  → 開始 {tpl['id']} {tpl['name']}")
                 # 音樂隨機抽（沒音樂就無法做，報明確錯）
                 if not music_paths:
                     raise RuntimeError("Drive「音樂」資料夾沒有可用音樂")
@@ -290,10 +308,10 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
                     voice_path=voice_path, subtitle_lines=subtitle_lines,
                     sticker_paths=stickers, workdir=wd)
                 upload_file(up_drive, out_folder_id, out_path, using_oauth=using_oauth)
-                print(f"  ✅ {tpl['id']} {tpl['name']}（{info}，{time.time()-t0:.1f}s）")
+                log(f"  ✅ {tpl['id']} 完成並上傳（{info}，{time.time()-t0:.1f}s）")
                 ok.append(tpl["id"])
             except Exception as e:
-                print(f"  ❌ {tpl['id']} {tpl['name']} 失敗：{e}")
+                log(f"  ❌ {tpl['id']} 失敗：{e}")
                 failed.append(f"{tpl['id']}({type(e).__name__})")
             finally:
                 shutil.rmtree(wd, ignore_errors=True)
@@ -318,12 +336,15 @@ def main():
     if not templates:
         print("❌ templates 資料夾裡沒有任何模板 json")
         sys.exit(1)
-    print(f"已載入 {len(templates)} 個模板：{'、'.join(t['id'] for t in templates)}")
+    log(f"已載入 {len(templates)} 個模板：{'、'.join(t['id'] for t in templates)}")
 
+    log("建立服務帳戶連線...")
     drive = get_drive()
+    log("服務帳戶連線完成")
 
     with open(GOOGLE_KEY_PATH, encoding="utf-8") as f:
         sa_email = json.load(f).get("client_email", "(讀不到)")
+    log("查詢根資料夾（若卡在這裡代表連 Drive 有問題）...")
     try:
         root = drive.files().get(fileId=DRIVE_ROOT_FOLDER_ID, fields="id,name,mimeType",
                                  supportsAllDrives=True).execute()
@@ -337,18 +358,18 @@ def main():
     if root["mimeType"] != FOLDER_MIME:
         print(f"❌ 這個ID指到的是檔案不是資料夾：{root['name']}")
         sys.exit(1)
-    print(f"根資料夾確認：「{root['name']}」")
+    log(f"根資料夾確認：「{root['name']}」")
 
     user_drive = get_user_drive()
     if user_drive is not None:
         try:
             user_drive.files().get(fileId=DRIVE_ROOT_FOLDER_ID, fields="id").execute()
-            print("上傳身分：你本人帳號（成品算你的 5TB）")
+            log("上傳身分：你本人帳號（成品算你的 5TB）")
         except Exception as e:
             print(f"⚠️ OAuth 連線建立了但看不到根資料夾，退回服務帳戶上傳。原因：{e}")
             user_drive = None
     else:
-        print("上傳身分：服務帳戶（⚠️ 只有15GB，OAuth 尚未設定）")
+        log("上傳身分：服務帳戶（⚠️ 只有15GB，OAuth 尚未設定）")
 
     inbox_id = find_child(drive, DRIVE_ROOT_FOLDER_ID, INBOX_NAME)
     done_id = find_child(drive, DRIVE_ROOT_FOLDER_ID, DONE_NAME)
@@ -366,17 +387,17 @@ def main():
     todo_count = 0
     asset_dir = tempfile.mkdtemp(prefix="assets_")
     try:
-        print("下載音樂與貼圖中...")
+        log("開始下載音樂與貼圖...")
         music_paths, sticker_pools = download_assets(drive, DRIVE_ROOT_FOLDER_ID, asset_dir)
         pool_summary = "、".join(f"{c}:{len(sticker_pools[c])}張" for c in STICKER_CATEGORIES)
-        print(f"音樂 {len(music_paths)} 首｜貼圖 {pool_summary}")
+        log(f"素材下載完成：音樂 {len(music_paths)} 首｜貼圖 {pool_summary}")
         if not music_paths:
             notify("❌ Drive「音樂」資料夾沒有可用音樂，無法出片。請上傳可商用音檔到「自動剪片/音樂/」。")
             return
 
         todo = batches[:MAX_BATCHES_PER_RUN]
         todo_count = len(todo)
-        print(f"待處理 {len(batches)} 批，本次處理 {todo_count} 批。")
+        log(f"待處理 {len(batches)} 批，本次處理 {todo_count} 批")
 
         results = []
         for b in todo:
@@ -404,3 +425,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
