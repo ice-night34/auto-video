@@ -6,7 +6,6 @@
     "from": 1.0,
     "to": 1.15
   },
-  "corner_light": "top_left",
   "end_fade_out": 0.5,
   "sticker_pool": "一般",
   "sticker_count": [
