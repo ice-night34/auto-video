@@ -170,6 +170,25 @@ SPECIAL_OPENINGS = {"grid", "circle", "time_shuffle", "reverse", "wave"}
 
 # ============ 特殊開頭：生成獨立前段影片 ============
 
+
+def _concat_files(paths, out, workdir, tag):
+    """把多段影片接起來。
+
+    ⚠️ 刻意「重新編碼」而不是用 -c copy 直接複製接合。
+    -c copy 要求每段的編碼參數完全一致，只要有一點不同（例如某段經過半解析度處理），
+    接出來就會出現大面積綠色破塊——這就是先前 T03/T06 綠屏的真正原因。
+    重新編碼慢一點點，但保證畫面正確。
+    """
+    listf = os.path.join(workdir, f"_cc_{tag}.txt")
+    with open(listf, "w") as f:
+        for p in paths:
+            f.write(f"file '{os.path.abspath(p)}'\n")
+    run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", listf,
+         "-vf", f"scale={W}:{H},fps={FPS},format=yuv420p", "-an",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", out])
+    return out
+
+
 def _make_grid_opening(normalized, dur, out):
     seg = min(OPENING_SECONDS, dur)
     cw, ch = W // 3, H // 3          # 先在 Python 算好格子尺寸，ffmpeg filter 不認 // 運算
@@ -235,11 +254,7 @@ def _make_reverse_opening(normalized, dur, out, workdir, tid):
     run(["ffmpeg", "-y", "-loglevel", "error", "-i", normalized, "-vf",
          f"trim={seg}:{dur},setpts=PTS-STARTPTS,scale={W}:{H}", "-an",
          "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", tail])
-    listf = os.path.join(workdir, f"_revlist_{tid}.txt")
-    with open(listf, "w") as f:
-        f.write(f"file '{os.path.abspath(head)}'\nfile '{os.path.abspath(tail)}'\n")
-    run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-         "-i", listf, "-c", "copy", out])
+    _concat_files([head, tail], out, workdir, f"rev_{tid}")
     return out
 
 
@@ -254,12 +269,7 @@ def _make_time_shuffle(normalized, dur, out, workdir):
              "-vf", f"trim={i*seg}:{(i+1)*seg},setpts=PTS-STARTPTS,scale={W}:{H}",
              "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", p])
         parts.append(p)
-    listf = os.path.join(workdir, "_shuf.txt")
-    with open(listf, "w") as f:
-        for p in parts:
-            f.write(f"file '{os.path.abspath(p)}'\n")
-    run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-         "-i", listf, "-c", "copy", out])
+    _concat_files(parts, out, workdir, "shuf")
     return order
 
 
@@ -270,12 +280,8 @@ def _concat_opening_with_rest(normalized, opening_clip, seg, duration, workdir, 
     run(["ffmpeg", "-y", "-loglevel", "error", "-i", normalized,
          "-vf", f"trim={seg}:{duration},setpts=PTS-STARTPTS,scale={W}:{H}", "-an",
          "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", rest])
-    listf = os.path.join(workdir, f"_ol_{tid}.txt")
-    with open(listf, "w") as f:
-        f.write(f"file '{os.path.abspath(opening_clip)}'\nfile '{os.path.abspath(rest)}'\n")
     joined = os.path.join(workdir, f"_joined_{tid}.mp4")
-    run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-         "-i", listf, "-c", "copy", joined])
+    _concat_files([opening_clip, rest], joined, workdir, f"ol_{tid}")
     return joined
 
 
@@ -323,24 +329,48 @@ def pick_stickers(pool_files, count_range):
     return [random.choice(pool_files) for _ in range(n)]
 
 
-def _sticker_filter(idx, motion, slot, total_count):
-    base = 320 if total_count <= 2 else (240 if total_count <= 4 else 180)
-    edges = [(60, 120), (W - 60, 120), (60, H - 400), (W - 60, H - 400),
-             (60, H / 2), (W - 60, H / 2), (W / 2, 120), (W / 2, H - 300)]
-    px, py = edges[slot % len(edges)]
-    fade_at = round(random.uniform(0.1, 1.2), 2)
-    inp = f"[{idx}:v]scale={base}:-1,format=rgba,fade=t=in:st={fade_at}:d=0.4:alpha=1[s{idx}]"
+def _sticker_filter(idx, motion, slot, total_count, duration):
+    """貼圖的輸入濾鏡 + 疊加指令。
+
+    針對「太小、太晚出現、擠在角落沒存在感」調整：
+    - 尺寸放大到畫面寬度的 3-4 成（原本只有 1.7-3 成，在直式影片上幾乎看不到）
+    - 0.2~0.8 秒內就淡入完成（原本最晚到 1.2 秒才開始淡入，開頭都看不到）
+    - 位置改成「上下三分之一 + 兩側中段」，避開正中央商品但不再只擠在四個死角
+    - cross（橫move）改成走完整支片長，才有從頭飄到尾的效果
+    """
+    # 尺寸：數量越多稍微縮小，但最小也有 300（1080寬的28%）
+    base = 520 if total_count <= 2 else (420 if total_count <= 3 else 320)
+
+    # 位置池：避開畫面正中央（商品通常在中間），但比純四角更有存在感
+    spots = [
+        (W * 0.28, H * 0.20),   # 左上偏中
+        (W * 0.74, H * 0.20),   # 右上偏中
+        (W * 0.22, H * 0.76),   # 左下
+        (W * 0.78, H * 0.76),   # 右下
+        (W * 0.16, H * 0.48),   # 左側中段
+        (W * 0.84, H * 0.48),   # 右側中段
+        (W * 0.50, H * 0.14),   # 正上方
+        (W * 0.50, H * 0.84),   # 正下方
+    ]
+    px, py = spots[slot % len(spots)]
+    fade_at = round(random.uniform(0.2, 0.8), 2)   # 開頭就看得到
+
+    inp = f"[{idx}:v]scale={base}:-1,format=rgba,fade=t=in:st={fade_at}:d=0.35:alpha=1[s{idx}]"
+
     if motion == "float":
-        amp = random.randint(15, 35)
-        ov = f"overlay=x='{px}-w/2':y='{py}-h/2+{amp}*sin(t*2+{slot})':enable='gte(t,{fade_at})'"
+        amp = random.randint(25, 55)               # 飄動幅度加大才看得出來
+        ov = (f"overlay=x='{px:.0f}-w/2':y='{py:.0f}-h/2+{amp}*sin(t*2+{slot})'"
+              f":enable='gte(t,{fade_at})'")
     elif motion == "cross":
+        span = max(duration, 3)                    # 走完整支片，不是只走3秒就消失
         if slot % 2 == 0:
-            xexpr = f"-w+({W}+w)*t/3"
+            xexpr = f"-w+({W}+w)*t/{span:.2f}"
         else:
-            xexpr = f"{W}-({W}+w)*t/3"
-        ov = f"overlay=x='{xexpr}':y='{py}-h/2':enable='gte(t,{fade_at})'"
-    else:  # enter
-        ov = f"overlay=x='{px}-w/2':y='{py}-h/2':enable='gte(t,{fade_at})'"
+            xexpr = f"{W}-({W}+w)*t/{span:.2f}"
+        ov = f"overlay=x='{xexpr}':y='{py:.0f}-h/2':enable='gte(t,{fade_at})'"
+    else:  # enter：淡入後停住
+        ov = f"overlay=x='{px:.0f}-w/2':y='{py:.0f}-h/2':enable='gte(t,{fade_at})'"
+
     return inp, ov
 
 
@@ -410,7 +440,7 @@ def apply_template(normalized, duration, template, out_path, music_path,
 
     for n, sidx in enumerate(sticker_indices):
         motion = random.choice(template.get("sticker_motion", ["enter"]))
-        inp, ov = _sticker_filter(sidx, motion, n, len(sticker_paths))
+        inp, ov = _sticker_filter(sidx, motion, n, len(sticker_paths), duration)
         filters.append(inp)
         filters.append(f"{last}[s{sidx}]{ov}[st{n}]")
         last = f"[st{n}]"
@@ -451,3 +481,4 @@ def load_templates(templates_dir):
         with open(os.path.join(templates_dir, f), encoding="utf-8") as fp:
             out.append(json.load(fp))
     return out
+    
