@@ -42,6 +42,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 import render
+import template_import
 
 # ⚠️ 關鍵：Google API 套件預設「沒有逾時」，連線卡住會無限等下去
 # （實際發生過：卡在連 Drive 34分鐘完全沒有任何輸出）。
@@ -85,6 +86,7 @@ ARCHIVE_NAME = "03_已處理素材"
 MUSIC_NAME = "音樂"
 STICKER_NAME = "貼圖"
 STICKER_CATEGORIES = ["浮誇", "一般", "簡約"]
+TEMPLATE_FOLDER_NAME = "04_模板"
 
 MAX_BATCHES_PER_RUN = 8
 
@@ -233,6 +235,33 @@ def download_assets(drive, root_id, dest_dir):
     return music_paths, sticker_pools
 
 
+# ============ Drive 模板(04_模板 資料夾,丟威力導演專案 zip/pdrproj 自動轉)============
+
+def load_drive_templates(drive, root_id, dest_dir):
+    """掃 Drive「04_模板」,把 .zip/.pdrproj 自動轉成時間軸模板。
+    資料夾不存在或空的都沒關係,回傳空清單。轉壞的檔案跳過並提醒,不擋主流程。"""
+    fid = find_child(drive, root_id, TEMPLATE_FOLDER_NAME)
+    out = []
+    if not fid:
+        return out
+    files = [f for f in list_children(drive, fid) if f["mimeType"] != FOLDER_MIME
+             and os.path.splitext(f["name"])[1].lower() in (".zip", ".pdrproj")]
+    for i, f in enumerate(sorted(files, key=lambda x: x["name"])):
+        p = os.path.join(dest_dir, f["name"])
+        try:
+            download_file(drive, f["id"], p)
+            tid = f"D{i+1:02d}"
+            tpl = template_import.convert(p, os.path.join(dest_dir, f"template_{tid}.json"),
+                                          template_id=tid)
+            tpl["name"] = f"{tid} {os.path.splitext(f['name'])[0]}"
+            out.append(tpl)
+            log(f"Drive 模板「{f['name']}」→ {tid}"
+                + (f"(⚠️{len(tpl['unsupported'])}個特效未支援)" if tpl.get("unsupported") else ""))
+        except Exception as e:
+            print(f"⚠️ Drive 模板「{f['name']}」轉換失敗,跳過:{e}")
+    return out
+
+
 # ============ 單一批次 ============
 
 def classify_files(files):
@@ -300,8 +329,7 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
                 log(f"⚠️ 自動配音失敗,這批改為只上字幕不配音:{e}")
                 voice_path = None
 
-        # 字幕對齊:用 faster-whisper 把字幕對到真正說話的時間點,
-        # 整批只做一次、10 個模板共用;失敗自動退回平均分配
+        # 字幕對齊:整批只做一次、10 個模板共用;失敗自動退回平均分配
         subtitle_timed = None
         if voice_path and subtitle_lines:
             log("開始字幕對齊(faster-whisper)...")
@@ -422,6 +450,10 @@ def main():
     todo_count = 0
     asset_dir = tempfile.mkdtemp(prefix="assets_")
     try:
+        drive_tpls = load_drive_templates(drive, DRIVE_ROOT_FOLDER_ID, asset_dir)
+        if drive_tpls:
+            templates = templates + drive_tpls
+            log(f"含 Drive 模板共 {len(templates)} 個模板")
         log("開始下載音樂與貼圖...")
         music_paths, sticker_pools = download_assets(drive, DRIVE_ROOT_FOLDER_ID, asset_dir)
         pool_summary = "、".join(f"{c}:{len(sticker_pools[c])}張" for c in STICKER_CATEGORIES)
