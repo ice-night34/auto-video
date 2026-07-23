@@ -17,6 +17,7 @@ import json
 import os
 import random
 import subprocess
+import time
 
 W, H, FPS = 1080, 1920, 30
 MIN_DURATION = 6.0
@@ -33,10 +34,29 @@ AUDIO_EXT = {".m4a", ".mp3", ".wav", ".aac", ".ogg", ".flac"}
 TEXT_EXT = {".txt"}
 
 
-def run(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True)
+# 單一 ffmpeg 指令的最長容許時間。超過就強制中止那一步。
+# 用意：任何一個效果出問題時，只會讓「那一支影片」失敗，
+# 不會像之前那樣一支卡住就吃掉整個執行（曾經一支卡25分鐘）。
+FFMPEG_TIMEOUT = 180
+
+
+VERBOSE = True   # 印出每個 ffmpeg 步驟，卡住時才知道死在哪一步
+
+
+def run(cmd, timeout=FFMPEG_TIMEOUT, step=""):
+    if VERBOSE and step:
+        print(f"        · {step} ...", flush=True)
+    _t = time.time()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"ffmpeg 執行超過 {timeout} 秒被中止（可能是某個效果參數有問題卡住）：\n"
+            f"{' '.join(cmd[:12])} ...")
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg 執行失敗：\n{' '.join(cmd)}\n\n{r.stderr[-3000:]}")
+    if VERBOSE and step:
+        print(f"        · {step} 完成 ({time.time()-_t:.1f}s)", flush=True)
     return r
 
 
@@ -81,7 +101,7 @@ def normalize_video(src, out_path, voice_duration=0.0):
         vf += f",setpts=PTS/{plan['speed']:.6f}"
     run(["ffmpeg", "-y", "-loglevel", "error", "-stream_loop", str(plan["loops"] - 1),
          "-i", src, "-an", "-vf", vf, "-t", str(final), "-c:v", "libx264",
-         "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", out_path])
+         "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", out_path], step="正規化影片")
     return final
 
 
@@ -100,7 +120,7 @@ def normalize_photos(photos, out_path, voice_duration=0.0):
     run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", listf,
          "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS}",
          "-t", str(final), "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-         "-pix_fmt", "yuv420p", out_path])
+         "-pix_fmt", "yuv420p", out_path], step="正規化影片")
     return final
 
 
@@ -133,7 +153,16 @@ def _fx_zoom_in(t, dur):
 
 
 def _fx_punch_in(t, dur):
-    c = (f"[0:v]scale={W}:{H},zoompan=z='if(lte(on,{int(FPS*0.5)}),1.4-0.8*(on/{int(FPS*0.5)}),1.0)':"
+    """前0.5秒畫面從140%快速縮回100%，像「咻」一下對焦。
+
+    ⚠️ 這裡踩過坑：原本寫 1.4-0.8*(進度)，跑到最後會變成 0.6——
+    zoompan 的縮放倍率不能小於 1.0，跌破 1 會產生未定義行為，
+    在某些機器上會直接卡死不動（實際發生過，一支卡了25分鐘）。
+    正確是 1.4-0.4*(進度)，剛好從 1.4 收到 1.0，並用 max(...,1.0) 再保險一層。
+    """
+    n = int(FPS * 0.5)
+    c = (f"[0:v]scale={W}:{H},"
+         f"zoompan=z='max(if(lte(on,{n}),1.4-0.4*(on/{n}),1.0),1.0)':"
          f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={W}x{H}:fps={FPS}[vbase]")
     return c, "[vbase]"
 
@@ -329,6 +358,21 @@ def pick_stickers(pool_files, count_range):
     return [random.choice(pool_files) for _ in range(n)]
 
 
+def _prescale_sticker(src, target_w, workdir, tag):
+    """把貼圖先縮成目標尺寸存成小檔，只做一次。
+
+    ⚠️ 這是效能關鍵：原本直接把原始大PNG丟進 -loop 1，
+    ffmpeg 會對「影片的每一格」都重新解碼＋縮放那張大圖
+    （7秒影片=210格，一張3000x3000的圖就被處理210次）。
+    實測3張大貼圖會讓單支從3.7秒變成42.6秒，在慢機器上等於卡死。
+    先縮一次再用，貼圖成本就幾乎歸零。
+    """
+    out = os.path.join(workdir, f"_stk_{tag}.png")
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+         "-vf", f"scale={target_w}:-1:flags=bilinear", "-frames:v", "1", out])
+    return out
+
+
 def _sticker_filter(idx, motion, slot, total_count, duration):
     """貼圖的輸入濾鏡 + 疊加指令。
 
@@ -355,7 +399,8 @@ def _sticker_filter(idx, motion, slot, total_count, duration):
     px, py = spots[slot % len(spots)]
     fade_at = round(random.uniform(0.2, 0.8), 2)   # 開頭就看得到
 
-    inp = f"[{idx}:v]scale={base}:-1,format=rgba,fade=t=in:st={fade_at}:d=0.35:alpha=1[s{idx}]"
+    # 貼圖已在外面預先縮好，這裡不再 scale（避免每格重複縮放）
+    inp = f"[{idx}:v]format=rgba,fade=t=in:st={fade_at}:d=0.35:alpha=1[s{idx}]"
 
     if motion == "float":
         amp = random.randint(25, 55)               # 飄動幅度加大才看得出來
@@ -371,7 +416,7 @@ def _sticker_filter(idx, motion, slot, total_count, duration):
     else:  # enter：淡入後停住
         ov = f"overlay=x='{px:.0f}-w/2':y='{py:.0f}-h/2':enable='gte(t,{fade_at})'"
 
-    return inp, ov
+    return inp, ov, base
 
 
 # ============ 套模板 ============
@@ -415,7 +460,16 @@ def apply_template(normalized, duration, template, out_path, music_path,
            "-stream_loop", "-1", "-ss", str(music_ss), "-i", music_path]
     idx = 2
     sticker_indices = []
-    for sp in sticker_paths:
+    # 先算好每張要多大，預縮一次（見 _prescale_sticker 的說明）
+    n_stk = len(sticker_paths)
+    stk_w = 520 if n_stk <= 2 else (420 if n_stk <= 3 else 320)
+    small_stickers = []
+    for i, sp in enumerate(sticker_paths):
+        try:
+            small_stickers.append(_prescale_sticker(sp, stk_w, workdir, f"{template['id']}_{i}"))
+        except Exception as e:
+            print(f"⚠️ 貼圖 {os.path.basename(sp)} 預處理失敗，跳過：{e}")
+    for sp in small_stickers:
         cmd += ["-loop", "1", "-i", sp]
         sticker_indices.append(idx)
         idx += 1
@@ -440,7 +494,7 @@ def apply_template(normalized, duration, template, out_path, music_path,
 
     for n, sidx in enumerate(sticker_indices):
         motion = random.choice(template.get("sticker_motion", ["enter"]))
-        inp, ov = _sticker_filter(sidx, motion, n, len(sticker_paths), duration)
+        inp, ov, _ = _sticker_filter(sidx, motion, n, len(sticker_indices), duration)
         filters.append(inp)
         filters.append(f"{last}[s{sidx}]{ov}[st{n}]")
         last = f"[st{n}]"
@@ -457,28 +511,4 @@ def apply_template(normalized, duration, template, out_path, music_path,
                    f"afade=t=out:st={fade_st}:d={MUSIC_FADE_OUT}[music]")
     if voice_idx is not None:
         filters.append(f"[{voice_idx}:a]aresample=44100[voice]")
-        filters.append("[music][voice]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]")
-        aout = "[aout]"
-    else:
-        aout = "[music]"
-
-    cmd += ["-filter_complex", ";".join(filters), "-map", last, "-map", aout,
-            "-t", str(duration), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart", out_path]
-    run(cmd)
-
-    picked = [f"開頭 {opening}", f"音樂 {os.path.basename(music_path)}"]
-    if sticker_paths:
-        picked.append(f"貼圖 {len(sticker_paths)}張")
-    return "、".join(picked)
-
-
-def load_templates(templates_dir):
-    files = sorted(f for f in os.listdir(templates_dir) if f.endswith(".json"))
-    out = []
-    for f in files:
-        with open(os.path.join(templates_dir, f), encoding="utf-8") as fp:
-            out.append(json.load(fp))
-    return out
-    
+     
