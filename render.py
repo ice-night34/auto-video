@@ -683,6 +683,47 @@ def _sticker_filter(idx, motion, slot, total_count, duration):
 
 # ============ 套模板 ============
 
+def apply_fixed_texts(last_label, template, duration, filters):
+    """把模板裡的 fixed_texts(固定文字方塊)用 drawtext 疊進 filter_complex。
+    座標 cx/cy 是 0~1 中心點相對值。字體找不到就退回 Noto Sans CJK TC。
+    """
+    texts = template.get("fixed_texts", [])
+    if not texts:
+        return last_label
+
+    fallback_font = "Noto Sans CJK TC"
+    src_dur = template.get("source_duration") or duration
+    scale = duration / max(src_dur, 0.1)
+
+    for i, t in enumerate(texts):
+        raw = t.get("text", "")
+        text = raw.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+        cx     = t.get("cx", 0.5)
+        cy     = t.get("cy", 0.5)
+        sz     = t.get("font_size", 64)
+        color  = t.get("color", "0xFFFFFF")
+        fp     = t.get("font_path")
+        t_start = round(t.get("start", 0.0) * scale, 3)
+        t_end   = round(min(t.get("end", duration) * scale, duration), 3)
+
+        if fp and os.path.exists(fp):
+            font_arg = f"fontfile={fp}"
+        else:
+            font_arg = f"font={fallback_font}"
+
+        x_expr = f"(w-text_w)/2+({cx:.4f}-0.5)*w"
+        y_expr = f"{cy:.4f}*h-text_h/2"
+        enable = f"between(t,{t_start},{t_end})"
+        out_label = f"[ft{i}]"
+        filters.append(
+            f"{last_label}drawtext={font_arg}:text='{text}'"
+            f":fontcolor={color}:fontsize={sz}"
+            f":x='{x_expr}':y='{y_expr}'"
+            f":enable='{enable}'{out_label}"
+        )
+        last_label = out_label
+    return last_label
+
 def apply_template(normalized, duration, template, out_path, music_path,
                    voice_path=None, subtitle_lines=None, subtitle_timed=None,
                    sticker_paths=None, workdir=None):
@@ -773,6 +814,9 @@ def apply_template(normalized, duration, template, out_path, music_path,
                   timed=subtitle_timed)
         filters.append(f"{last}ass={ass}[vout]")
         last = "[vout]"
+
+    # 固定文字方塊(從威力導演模板讀入,燒死在畫面上)
+    last = apply_fixed_texts(last, template, duration, filters)
 
     music_vol = MUSIC_VOLUME_WITH_VOICE if voice_path else 1.0
     fade_st = max(duration - MUSIC_FADE_OUT, 0)
