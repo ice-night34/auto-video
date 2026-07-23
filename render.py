@@ -91,7 +91,9 @@ def plan_video(src_duration, voice_duration=0.0):
     if src_duration > MAX_DURATION:
         if voice_duration > 0:
             return {"loops": 1, "speed": 1.0, "cut_to": src_duration}
-        return {"loops": 1, "speed": src_duration / MAX_DURATION, "cut_to": MAX_DURATION}
+        # cut_to 是「來源時間」:給全長,除以速度後輸出正好 15 秒
+        # (之前給 15 會被再除一次速度,24.6秒素材只出 9.1 秒——實測抓到的 bug)
+        return {"loops": 1, "speed": src_duration / MAX_DURATION, "cut_to": src_duration}
     target = max(MIN_DURATION, voice_duration)
     loops = 1
     while src_duration * loops <= target:
@@ -320,7 +322,180 @@ def _concat_opening_with_rest(normalized, opening_clip, seg, duration, workdir, 
     return joined
 
 
-# ============ 字幕 ============
+# ============ 時間軸模板(從剪輯軟體匯入)============
+# 每個特效函式吃 (該段長度d, 參數dict),回傳:
+#   ("vf", 濾鏡字串) 或 ("fc", filter_complex字串, 輸出標籤)
+# 都是對「已裁出的那一段」操作,段內時間 t 從 0 開始。
+
+def _tfx_circle_open(d, p):
+    hw, hh = W // 2, H // 2
+    grow = max((max(hw, hh) * 0.75) / max(d, 0.1), 30)   # 段長內長到接近全屏
+    fc = (f"[0:v]scale={hw}:{hh},split[sharp][forblur];"
+          f"[forblur]boxblur=15:2[blur];"
+          f"[sharp]format=yuva420p,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+          f"a='if(lte((X-{hw}/2)*(X-{hw}/2)+(Y-{hh}/2)*(Y-{hh}/2),(60+{grow:.0f}*T)*(60+{grow:.0f}*T)),255,0)'[m];"
+          f"[blur][m]overlay,scale={W}:{H}[out]")
+    return ("fc", fc, "[out]")
+
+
+def _grid_fc(n):
+    cw, ch = W // n, H // n
+    labels = "abcdefghijklmnop"[: n * n]
+    fc = f"[0:v]scale={cw}:{ch}[c];[c]split={n*n}" + "".join(f"[{l}]" for l in labels) + ";"
+    fc += f"color=c=black:size={W}x{H}:r={FPS}[bg];"
+    prev = "[bg]"
+    for i, l in enumerate(labels):
+        x, y = (i % n) * cw, (i // n) * ch
+        out = f"[p{i}]" if i < n * n - 1 else "[out]"
+        fc += f"{prev}[{l}]overlay={x}:{y}:shortest=1{out};"
+        prev = out
+    return ("fc", fc.rstrip(";"), "[out]")
+
+
+def _tfx_grid(d, p):
+    # TvWall 的 Hori_N/Vert_N 參數大約是 3 → 3×3;取整數、限制 2~3
+    n = int(round(float(p.get("Hori_N", 3))))
+    return _grid_fc(min(max(n, 2), 3))
+
+
+def _tfx_grid3(d, p):
+    return _grid_fc(3)
+
+
+def _tfx_grid2(d, p):
+    return _grid_fc(2)
+
+
+def _tfx_rocking(d, p):
+    # 放大 12% 再用正弦位移裁切,畫面左右上下晃動
+    sw, sh = int(W * 1.12), int(H * 1.12)
+    return ("vf", f"scale={sw}:{sh},"
+                  f"crop={W}:{H}:x='({sw}-{W})/2+{int(W*0.04)}*sin(t*9)':"
+                  f"y='({sh}-{H})/2+{int(H*0.02)}*sin(t*7+1)'")
+
+
+def _tfx_stutter(d, p):
+    # 連拍感:降到低幀率產生頓格(Segment 參數越大越碎)
+    seg = int(p.get("Segment", 2))
+    return ("vf", f"fps={max(3, 2 + seg * 2)}")
+
+
+def _tfx_spin_in(d, p):
+    # 旋轉入場:開頭轉一整圈逐漸停住,同時從放大收回
+    sw, sh = int(W * 1.6), int(H * 1.6)
+    return ("vf", f"scale={sw}:{sh},"
+                  f"rotate='6.2832*pow(max(1-t/{max(d,0.1):.2f},0),2)':ow={sw}:oh={sh}:c=black,"
+                  f"crop={W}:{H}")
+
+
+def _sparkle_chain(d, density, rm, gm, bm, label):
+    """閃爍光點產生鏈:黑底上用每像素亂數直接控制光點密度(density=0.003 即 0.3%),
+    每一格重抽所以自帶閃爍感;放大到全解析度時邊緣自然柔化。
+    rm/gm/bm 是顏色比例(1,1,1=白、1,0.65,0.8=粉紅)。
+    注意:blend 只有平面 gbrp 色彩正確,packed rgb24 會色板錯置(實測踩坑)。"""
+    return (f"color=c=black:s=540x960:r={FPS}:d={d:.2f},format=gray,"
+            f"geq=lum='255*lt(random(1),{density})',"
+            f"scale={W}:{H},format=rgb24,"
+            f"colorchannelmixer=rr={rm}:gg={gm}:bb={bm},"   # 上色要在轉 gbrp 之前(lutrgb 對 gbrp 不作用,實測)
+            f"format=gbrp{label}")
+
+
+def _tfx_sparkle_pink(d, p):     # Variety_03:粉紅亮片
+    fc = (f"[0:v]format=gbrp[base];{_sparkle_chain(d, 0.013, 1.0, 0.65, 0.8, '[sp]')};"
+          f"[base][sp]blend=all_mode=screen,format=yuv420p[out]")
+    return ("fc", fc, "[out]")
+
+
+def _tfx_sparkle_white(d, p):    # Variety_08:白色亮片
+    fc = (f"[0:v]format=gbrp[base];{_sparkle_chain(d, 0.009, 1.0, 1.0, 1.0, '[sp]')};"
+          f"[base][sp]blend=all_mode=screen,format=yuv420p[out]")
+    return ("fc", fc, "[out]")
+
+
+def _tfx_glow_burst(d, p):       # Atmosphere_06:開場紫紅閃光→白色光塵
+    fc = (f"[0:v]format=gbrp[base];"
+          f"color=c=0x9B4FD0:s={W}x{H}:r={FPS}:d={d:.2f},"
+          f"vignette=PI/3.5,fade=t=out:st=0.05:d=0.7,format=gbrp[fl];"
+          f"{_sparkle_chain(d, 0.003, 1.0, 1.0, 1.0, '[sp]')};"
+          f"[base][fl]blend=all_mode=screen[b1];"
+          f"[b1][sp]blend=all_mode=screen,format=yuv420p[out]")
+    return ("fc", fc, "[out]")
+
+
+def _tfx_light_sweep(d, p):      # Light_14:藍紫漏光從左上掃向右上、漸強
+    dd = max(d, 0.1)
+    fc = (f"[0:v]format=gbrp[base];"
+          f"color=c=black:s=270x480:r={FPS}:d={d:.2f},format=gray,"
+          f"geq=lum='min(T/{dd:.2f},1)*235*exp(-(pow(X-270*(0.12+0.62*T/{dd:.2f}),2)"
+          f"+pow(Y-90,2))/16200)',"
+          f"boxblur=6:2,scale={W}:{H},format=gbrp,"
+          f"lutrgb=r=val*0.8:g=val*0.6:b=val[lk];"
+          f"[base][lk]blend=all_mode=screen,format=yuv420p[out]")
+    return ("fc", fc, "[out]")
+
+
+TIMELINE_FX = {"circle_open": _tfx_circle_open, "grid": _tfx_grid, "grid3": _tfx_grid3,
+               "grid2": _tfx_grid2, "rocking": _tfx_rocking, "stutter": _tfx_stutter,
+               "spin_in": _tfx_spin_in,
+               "glow_burst": _tfx_glow_burst, "light_sweep": _tfx_light_sweep,
+               "sparkle_pink": _tfx_sparkle_pink, "sparkle_white": _tfx_sparkle_white}
+
+
+def render_timeline(normalized, duration, template, out, workdir):
+    """把匯入模板的特效段套到正規化影片上。
+
+    模板時間軸和實際素材長度多半不同(模板22秒、素材可能8秒),
+    這裡把段落邊界「等比例縮放」到實際長度——每個特效都會出現,只是各自變短/變長。
+    沒有近似版的段落照原片播(不會失敗,只是那段沒特效)。
+    """
+    src_dur = template.get("source_duration") or duration
+    scale = duration / max(src_dur, 0.1)
+    parts = []
+    cursor = 0.0
+    segs = sorted(template.get("segments", []), key=lambda s: s["start"])
+
+    def cut_plain(a, b, tag):
+        pth = os.path.join(workdir, f"_tl_plain_{tag}.mp4")
+        run(["ffmpeg", "-y", "-loglevel", "error", "-i", normalized,
+             "-vf", f"trim={a:.3f}:{b:.3f},setpts=PTS-STARTPTS,scale={W}:{H}", "-an",
+             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", pth])
+        return pth
+
+    for i, s in enumerate(segs):
+        a, b = s["start"] * scale, min(s["end"] * scale, duration)
+        if b - a < 0.15 or a >= duration:
+            continue
+        if a > cursor + 0.05:                      # 段落間的空隙照原片播
+            parts.append(cut_plain(cursor, a, f"g{i}"))
+        fx = TIMELINE_FX.get(s["fx"])
+        pth = os.path.join(workdir, f"_tl_{i}_{s['fx']}.mp4")
+        if fx is None:
+            parts.append(cut_plain(a, b, f"u{i}"))
+        else:
+            kind, *rest = fx(b - a, s.get("params", {}))
+            base = ["ffmpeg", "-y", "-loglevel", "error", "-i", normalized]
+            pre_vf = f"trim={a:.3f}:{b:.3f},setpts=PTS-STARTPTS,scale={W}:{H}"
+            if kind == "vf":
+                cmd = base + ["-vf", f"{pre_vf},{rest[0]}", "-an",
+                              "-c:v", "libx264", "-preset", "veryfast",
+                              "-pix_fmt", "yuv420p", pth]
+            else:
+                fc = rest[0].replace("[0:v]", f"[0:v]{pre_vf},", 1)
+                cmd = base + ["-filter_complex", fc, "-map", rest[1],
+                              "-t", f"{b-a:.3f}", "-an", "-c:v", "libx264",
+                              "-preset", "veryfast", "-pix_fmt", "yuv420p", pth]
+            run(cmd, step=f"時間軸段 {s['fx']}")
+            parts.append(pth)
+        cursor = b
+    if cursor < duration - 0.1:
+        parts.append(cut_plain(cursor, duration, "tail"))
+    if not parts:
+        return normalized
+    _concat_files(parts, out, workdir, "tl")   # 重新編碼接合(綠幕教訓)
+    return out
+
+
+
 
 def build_ass(ass_path, lines, total, style, timed=None):
     """timed 若提供,格式是 [(開始秒, 結束秒, 文字), ...],用真正對齊過的時間;
@@ -505,7 +680,10 @@ def apply_template(normalized, duration, template, out_path, music_path,
     sticker_paths = sticker_paths or []
 
     processed = normalized
-    if opening in SPECIAL_OPENINGS:
+    if template.get("type") == "timeline":
+        pre = os.path.join(workdir, f"_tl_{template['id']}.mp4")
+        processed = render_timeline(normalized, duration, template, pre, workdir)
+    elif opening in SPECIAL_OPENINGS:
         pre = os.path.join(workdir, f"_pre_{template['id']}.mp4")
         if opening == "grid":
             seg = _make_grid_opening(normalized, duration, pre)
@@ -557,7 +735,7 @@ def apply_template(normalized, duration, template, out_path, music_path,
         idx += 1
 
     filters = []
-    if opening in SIMPLE_FX:
+    if template.get("type") != "timeline" and opening in SIMPLE_FX:
         chain, last = SIMPLE_FX[opening](template, duration)
         filters.append(chain)
     else:
@@ -603,6 +781,10 @@ def apply_template(normalized, duration, template, out_path, music_path,
     run(cmd, step=f"{template['id']} 合成輸出")
 
     picked = [f"開頭 {opening}", f"音樂 {os.path.basename(music_path)}"]
+    if template.get("type") == "timeline":
+        picked[0] = f"時間軸模板 {len(template.get('segments', []))}段"
+        if template.get("unsupported"):
+            picked.append(f"⚠️未支援特效:{len(template['unsupported'])}個")
     if sticker_indices:
         picked.append(f"貼圖 {len(sticker_indices)}張")
     return "、".join(picked)
