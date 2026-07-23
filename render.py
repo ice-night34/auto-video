@@ -80,6 +80,12 @@ def is_readable(path):
 # ============ 正規化 ============
 
 def plan_video(src_duration, voice_duration=0.0):
+    # 有語音且語音比影片長:影片重複到超過語音長度,不加速、不受15秒限制
+    if voice_duration > src_duration:
+        loops = 1
+        while src_duration * loops < voice_duration:
+            loops += 1
+        return {"loops": loops, "speed": 1.0, "cut_to": src_duration * loops}
     if src_duration > SPEEDUP_LIMIT:
         return {"loops": 1, "speed": 1.0, "cut_to": MAX_DURATION}
     if src_duration > MAX_DURATION:
@@ -316,8 +322,11 @@ def _concat_opening_with_rest(normalized, opening_clip, seg, duration, workdir, 
 
 # ============ 字幕 ============
 
-def build_ass(ass_path, lines, total, style):
+def build_ass(ass_path, lines, total, style, timed=None):
+    """timed 若提供,格式是 [(開始秒, 結束秒, 文字), ...],用真正對齊過的時間;
+    沒提供就退回「平均分配」的舊行為。"""
     def ts(sec):
+        sec = max(0.0, min(sec, total))
         h, rem = divmod(sec, 3600)
         m, s = divmod(rem, 60)
         return f"{int(h)}:{int(m):02d}:{s:05.2f}"
@@ -337,8 +346,70 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, Effect, Text
 """
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(header)
-        for i, line in enumerate(lines):
-            f.write(f"Dialogue: 0,{ts(i*per)},{ts((i+1)*per)},Default,,0,0,,{line}\n")
+        if timed:
+            for st, en, text in timed:
+                f.write(f"Dialogue: 0,{ts(st)},{ts(en)},Default,,0,0,,{text}\n")
+        else:
+            for i, line in enumerate(lines):
+                f.write(f"Dialogue: 0,{ts(i*per)},{ts((i+1)*per)},Default,,0,0,,{line}\n")
+
+
+def align_subtitles(voice_path, lines):
+    """用 faster-whisper(免費、CPU可跑)聽出語音的實際時間分佈,
+    把逐字稿的每一句對到真正說話的時間點。
+
+    做法:辨識出「哪些時間段有人在講話、講了幾個字」,再把你的字幕句
+    依字數比例鋪在真實說話區間上(自動跳過開頭結尾的空白/呼吸)。
+    比逐字強制對齊輕量得多,對短影音的句級字幕已經足夠準。
+    任何一步失敗都回傳 None,外面就自動退回平均分配,不會讓整支失敗。"""
+    if not voice_path or not lines:
+        return None
+    try:
+        from faster_whisper import WhisperModel
+        model = WhisperModel("base", device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(voice_path, language="zh", vad_filter=True)
+        segs = [(s.start, s.end) for s in segments]
+        if not segs:
+            return None
+        speech_start, speech_end = segs[0][0], segs[-1][1]
+        span = speech_end - speech_start
+        if span <= 0.5:
+            return None
+        total_chars = sum(max(len(ln), 1) for ln in lines)
+        timed, cursor = [], speech_start
+        for ln in lines:
+            dur = span * max(len(ln), 1) / total_chars
+            timed.append((round(cursor, 2), round(cursor + dur, 2), ln))
+            cursor += dur
+        return timed
+    except Exception as e:
+        print(f"⚠️ 字幕對齊失敗,退回平均分配:{e}", flush=True)
+        return None
+
+
+# edge-tts 台灣中文聲線(免費、微軟商用級)
+TTS_VOICES = {
+    "曉臻": "zh-TW-HsiaoChenNeural",   # 女,自然(預設)
+    "曉雨": "zh-TW-HsiaoYuNeural",     # 女,較活潑
+    "雲哲": "zh-TW-YunJheNeural",      # 男
+}
+TTS_DEFAULT = "zh-TW-HsiaoChenNeural"
+
+
+def synthesize_voice(text, out_path, voice_name=None):
+    """把文字轉成語音檔(mp3)。voice_name 可以是「曉臻/曉雨/雲哲」或完整聲線代號。
+    成功回傳 out_path,失敗丟例外(由呼叫端決定要不要繼續)。"""
+    import asyncio
+    import edge_tts
+    voice = TTS_VOICES.get((voice_name or "").strip(), None) or \
+        (voice_name if voice_name and "-" in voice_name else TTS_DEFAULT)
+
+    async def _go():
+        await edge_tts.Communicate(text, voice, rate="+5%").save(out_path)
+    asyncio.run(_go())
+    if not is_readable(out_path):
+        raise RuntimeError("edge-tts 產出的語音檔無法讀取")
+    return out_path
 
 
 def read_script_lines(path):
@@ -397,7 +468,12 @@ def _sticker_filter(idx, motion, slot, total_count, duration):
         (W * 0.50, H * 0.84),   # 正下方
     ]
     px, py = spots[slot % len(spots)]
-    fade_at = round(random.uniform(0.2, 0.8), 2)   # 開頭就看得到
+    # 在基準點附近隨機偏移(±8%寬/±6%高),同一位置每次也長得不一樣
+    px += random.uniform(-W * 0.08, W * 0.08)
+    py += random.uniform(-H * 0.06, H * 0.06)
+    px = min(max(px, W * 0.12), W * 0.88)   # 夾住不出界
+    py = min(max(py, H * 0.10), H * 0.90)
+    fade_at = 0.0                            # 0秒就開始淡入,0.35秒完全現身
 
     # 貼圖已在外面預先縮好，這裡不再 scale（避免每格重複縮放）
     inp = f"[{idx}:v]format=rgba,fade=t=in:st={fade_at}:d=0.35:alpha=1[s{idx}]"
@@ -422,7 +498,8 @@ def _sticker_filter(idx, motion, slot, total_count, duration):
 # ============ 套模板 ============
 
 def apply_template(normalized, duration, template, out_path, music_path,
-                   voice_path=None, subtitle_lines=None, sticker_paths=None, workdir=None):
+                   voice_path=None, subtitle_lines=None, subtitle_timed=None,
+                   sticker_paths=None, workdir=None):
     opening = template.get("opening", "zoom_in")
     workdir = workdir or os.path.dirname(out_path)
     sticker_paths = sticker_paths or []
@@ -492,16 +569,19 @@ def apply_template(normalized, duration, template, out_path, music_path,
         filters.append(f"{last}fade=t=out:st={max(duration-d,0)}:d={d}[vfade]")
         last = "[vfade]"
 
+    slot_order = random.sample(range(8), 8)   # 位置順序每支影片重洗
     for n, sidx in enumerate(sticker_indices):
         motion = random.choice(template.get("sticker_motion", ["enter"]))
-        inp, ov, _ = _sticker_filter(sidx, motion, n, len(sticker_indices), duration)
+        inp, ov, _ = _sticker_filter(sidx, motion, slot_order[n % 8],
+                                     len(sticker_indices), duration)
         filters.append(inp)
         filters.append(f"{last}[s{sidx}]{ov}[st{n}]")
         last = f"[st{n}]"
 
     if subtitle_lines:
         ass = os.path.splitext(out_path)[0] + ".ass"
-        build_ass(ass, subtitle_lines, duration, template.get("subtitle_style", {}))
+        build_ass(ass, subtitle_lines, duration, template.get("subtitle_style", {}),
+                  timed=subtitle_timed)
         filters.append(f"{last}ass={ass}[vout]")
         last = "[vout]"
 
