@@ -159,10 +159,14 @@ def create_folder(drive, parent_id, name):
 
 def upload_file(drive, parent_id, local_path, mime="video/mp4", using_oauth=False):
     meta = {"name": os.path.basename(local_path), "parents": [parent_id]}
-    media = MediaFileUpload(local_path, mimetype=mime, resumable=True)
+    # ⚠️ 刻意用 resumable=False（一次傳完），不用分段續傳。
+    # 分段續傳遇到網路不順會「自動無限重試」，不報錯也不停止——
+    # 實際發生過：卡在上傳一支影片13分鐘完全沒有任何訊息。
+    # 一次傳完 + 限制重試2次，失敗就明確報錯，讓這支跳過、繼續下一支。
+    media = MediaFileUpload(local_path, mimetype=mime, resumable=False)
     try:
         return drive.files().create(body=meta, media_body=media, fields="id",
-                                    supportsAllDrives=True).execute()["id"]
+                                    supportsAllDrives=True).execute(num_retries=2)["id"]
     except Exception as e:
         if "storageQuotaExceeded" in str(e) or "quotaExceeded" in str(e):
             if using_oauth:
@@ -307,8 +311,11 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
                     normalized, duration, tpl, out_path, music,
                     voice_path=voice_path, subtitle_lines=subtitle_lines,
                     sticker_paths=stickers, workdir=wd)
+                size_mb = os.path.getsize(out_path) / 1024 / 1024
+                log(f"     剪片完成 {time.time()-t0:.1f}s（{size_mb:.1f}MB），開始上傳...")
+                tu = time.time()
                 upload_file(up_drive, out_folder_id, out_path, using_oauth=using_oauth)
-                log(f"  ✅ {tpl['id']} 完成並上傳（{info}，{time.time()-t0:.1f}s）")
+                log(f"  ✅ {tpl['id']} 完成（{info}｜上傳 {time.time()-tu:.1f}s｜共 {time.time()-t0:.1f}s）")
                 ok.append(tpl["id"])
             except Exception as e:
                 log(f"  ❌ {tpl['id']} 失敗：{e}")
