@@ -278,10 +278,37 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
             download_file(drive, cls["voice"]["id"], voice_path)
 
         subtitle_lines = None
+        tts_voice = None
         if cls["script"]:
             sp = os.path.join(workdir, cls["script"]["name"])
             download_file(drive, cls["script"]["id"], sp)
             subtitle_lines = render.read_script_lines(sp)
+            # txt 第一行可寫「#聲音=曉雨」指定配音聲線(曉臻/曉雨/雲哲),
+            # 這行是指令不是字幕,解析後拿掉
+            if subtitle_lines and subtitle_lines[0].replace("＃", "#").startswith("#聲音"):
+                tts_voice = subtitle_lines[0].split("=", 1)[-1].strip()
+                subtitle_lines = subtitle_lines[1:]
+
+        # 沒有錄音但有逐字稿 → 用 edge-tts 自動配音(免費)
+        if voice_path is None and subtitle_lines:
+            try:
+                log(f"沒有語音檔,用 edge-tts 自動配音(聲線:{tts_voice or '曉臻'})...")
+                voice_path = render.synthesize_voice(
+                    "。".join(subtitle_lines), os.path.join(workdir, "_tts.mp3"), tts_voice)
+                log("配音完成")
+            except Exception as e:
+                log(f"⚠️ 自動配音失敗,這批改為只上字幕不配音:{e}")
+                voice_path = None
+
+        # 字幕對齊:用 faster-whisper 把字幕對到真正說話的時間點,
+        # 整批只做一次、10 個模板共用;失敗自動退回平均分配
+        subtitle_timed = None
+        if voice_path and subtitle_lines:
+            log("開始字幕對齊(faster-whisper)...")
+            ta = time.time()
+            subtitle_timed = render.align_subtitles(voice_path, subtitle_lines)
+            log(f"字幕對齊{'完成' if subtitle_timed else '失敗,退回平均分配'}"
+                f"({time.time()-ta:.1f}s)")
 
         log("素材下載完成，開始正規化...")
         voice_dur = render.probe_duration(voice_path) if voice_path else 0.0
@@ -310,6 +337,7 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
                 info = render.apply_template(
                     normalized, duration, tpl, out_path, music,
                     voice_path=voice_path, subtitle_lines=subtitle_lines,
+                    subtitle_timed=subtitle_timed,
                     sticker_paths=stickers, workdir=wd)
                 size_mb = os.path.getsize(out_path) / 1024 / 1024
                 log(f"     剪片完成 {time.time()-t0:.1f}s（{size_mb:.1f}MB），開始上傳...")
