@@ -1,0 +1,122 @@
+{
+  "id": "P01",
+  "name": "匯入:專案_07-23(1)-2026-07-23T15_46_08",
+  "type": "timeline",
+  "source_duration": 22.0,
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 2.0,
+      "fx": "circle_open",
+      "params": {},
+      "raw": "CircleOpenFx"
+    },
+    {
+      "start": 2.0,
+      "end": 4.0,
+      "fx": "grid2",
+      "params": {},
+      "raw": "FourScreenSlideFx"
+    },
+    {
+      "start": 4.0,
+      "end": 6.0,
+      "fx": "rocking",
+      "params": {},
+      "raw": "Rocking02Fx"
+    },
+    {
+      "start": 6.0,
+      "end": 8.0,
+      "fx": "glow_burst",
+      "params": {
+        "Alpha": 1.0,
+        "Strength": 1.0
+      },
+      "raw": "OverlayFx#pdrm_VideoEffect_Atmosphere_06"
+    },
+    {
+      "start": 8.0,
+      "end": 10.0,
+      "fx": "stutter",
+      "params": {
+        "Segment": 2
+      },
+      "raw": "ContinuousShooting"
+    },
+    {
+      "start": 10.0,
+      "end": 12.0,
+      "fx": "grid3",
+      "params": {},
+      "raw": "MultiScreenFx_01"
+    },
+    {
+      "start": 12.0,
+      "end": 14.0,
+      "fx": "light_sweep",
+      "params": {
+        "Alpha": 1.0,
+        "Strength": 1.0
+      },
+      "raw": "OverlayFx#pdrm_VideoEffect_Light_14"
+    },
+    {
+      "start": 14.0,
+      "end": 16.0,
+      "fx": "spin_in",
+      "params": {},
+      "raw": "SpinInCircleFx"
+    },
+    {
+      "start": 16.0,
+      "end": 18.0,
+      "fx": "grid",
+      "params": {
+        "Hori_N": 2.95,
+        "Vert_N": 2.95
+      },
+      "raw": "TvWall"
+    },
+    {
+      "start": 18.0,
+      "end": 20.0,
+      "fx": "sparkle_pink",
+      "params": {
+        "Alpha": 1.0,
+        "Strength": 1.0
+      },
+      "raw": "OverlayFx#pdrm_VideoEffect_Variety_03"
+    },
+    {
+      "start": 20.0,
+      "end": 22.0,
+      "fx": "sparkle_white",
+      "params": {
+        "Alpha": 1.0,
+        "Strength": 1.0
+      },
+      "raw": "OverlayFx#pdrm_VideoEffect_Variety_08"
+    }
+  ],
+  "unsupported": [],
+  "end_fade_out": 0.5,
+  "sticker_pool": "一般",
+  "sticker_count": [
+    0,
+    2
+  ],
+  "sticker_motion": [
+    "enter"
+  ],
+  "subtitle_style": {
+    "font": "Noto Sans CJK TC",
+    "size": 64,
+    "bold": 1,
+    "primary_colour": "&H00FFFFFF",
+    "outline_colour": "&H00000000",
+    "outline": 4,
+    "margin_v": 260,
+    "alignment": 2
+  }
+}
