@@ -80,7 +80,7 @@ def is_readable(path):
 # ============ 正規化 ============
 
 def plan_video(src_duration, voice_duration=0.0):
-    # 有語音且語音比影片長:影片重複到超過語音長度,不加速、不受15秒限制
+    # 有語音且語音比影片長:影片重複到涵蓋語音長度,不加速、不受15秒限制
     if voice_duration > src_duration:
         loops = 1
         while src_duration * loops < voice_duration:
@@ -91,8 +91,8 @@ def plan_video(src_duration, voice_duration=0.0):
     if src_duration > MAX_DURATION:
         if voice_duration > 0:
             return {"loops": 1, "speed": 1.0, "cut_to": src_duration}
-        # cut_to 是「來源時間」:給全長,除以速度後輸出正好 15 秒
-        # (之前給 15 會被再除一次速度,24.6秒素材只出 9.1 秒——實測抓到的 bug)
+        # cut_to 是「來源時間」:給全長,除以速度後輸出正好15秒
+        # (給 15 會被再除一次速度,24.6秒素材只出 9.1 秒——實測抓到的 bug)
         return {"loops": 1, "speed": src_duration / MAX_DURATION, "cut_to": src_duration}
     target = max(MIN_DURATION, voice_duration)
     loops = 1
@@ -323,13 +323,15 @@ def _concat_opening_with_rest(normalized, opening_clip, seg, duration, workdir, 
 
 
 # ============ 時間軸模板(從剪輯軟體匯入)============
-# 每個特效函式吃 (該段長度d, 參數dict),回傳:
-#   ("vf", 濾鏡字串) 或 ("fc", filter_complex字串, 輸出標籤)
+# 每個特效函式吃 (該段長度d, 參數dict, workdir),回傳三種形式之一:
+#   ("vf", 濾鏡字串)
+#   ("fc", filter_complex字串, 輸出標籤)                  # 可在裡面用 color=/gradients= 生成層
+#   ("fci", filter_complex字串, 輸出標籤, [額外輸入檔])    # 額外檔以 -loop 1 -i 接在後面,從 [1:v] 起算
 # 都是對「已裁出的那一段」操作,段內時間 t 從 0 開始。
 
-def _tfx_circle_open(d, p):
+def _tfx_circle_open(d, p, workdir):
     hw, hh = W // 2, H // 2
-    grow = max((max(hw, hh) * 0.75) / max(d, 0.1), 30)   # 段長內長到接近全屏
+    grow = max((max(hw, hh) * 0.75) / max(d, 0.1), 30)
     fc = (f"[0:v]scale={hw}:{hh},split[sharp][forblur];"
           f"[forblur]boxblur=15:2[blur];"
           f"[sharp]format=yuva420p,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
@@ -352,102 +354,112 @@ def _grid_fc(n):
     return ("fc", fc.rstrip(";"), "[out]")
 
 
-def _tfx_grid(d, p):
-    # TvWall 的 Hori_N/Vert_N 參數大約是 3 → 3×3;取整數、限制 2~3
-    n = int(round(float(p.get("Hori_N", 3))))
+def _tfx_grid(d, p, workdir):
+    n = int(round(float(p.get("Hori_N", 3))))   # TvWall 參數 2.95→3
     return _grid_fc(min(max(n, 2), 3))
 
 
-def _tfx_grid3(d, p):
+def _tfx_grid3(d, p, workdir):
     return _grid_fc(3)
 
 
-def _tfx_grid2(d, p):
+def _tfx_grid2(d, p, workdir):
     return _grid_fc(2)
 
 
-def _tfx_rocking(d, p):
-    # 放大 12% 再用正弦位移裁切,畫面左右上下晃動
+def _tfx_rocking(d, p, workdir):
     sw, sh = int(W * 1.12), int(H * 1.12)
     return ("vf", f"scale={sw}:{sh},"
                   f"crop={W}:{H}:x='({sw}-{W})/2+{int(W*0.04)}*sin(t*9)':"
                   f"y='({sh}-{H})/2+{int(H*0.02)}*sin(t*7+1)'")
 
 
-def _tfx_stutter(d, p):
-    # 連拍感:降到低幀率產生頓格(Segment 參數越大越碎)
+def _tfx_stutter(d, p, workdir):
     seg = int(p.get("Segment", 2))
     return ("vf", f"fps={max(3, 2 + seg * 2)}")
 
 
-def _tfx_spin_in(d, p):
-    # 旋轉入場:開頭轉一整圈逐漸停住,同時從放大收回
+def _tfx_spin_in(d, p, workdir):
     sw, sh = int(W * 1.6), int(H * 1.6)
     return ("vf", f"scale={sw}:{sh},"
                   f"rotate='6.2832*pow(max(1-t/{max(d,0.1):.2f},0),2)':ow={sw}:oh={sh}:c=black,"
                   f"crop={W}:{H}")
 
 
-def _sparkle_chain(d, density, rm, gm, bm, label):
-    """閃爍光點產生鏈:黑底上用每像素亂數直接控制光點密度(density=0.003 即 0.3%),
-    每一格重抽所以自帶閃爍感;放大到全解析度時邊緣自然柔化。
-    rm/gm/bm 是顏色比例(1,1,1=白、1,0.65,0.8=粉紅)。
-    注意:blend 只有平面 gbrp 色彩正確,packed rgb24 會色板錯置(實測踩坑)。"""
-    return (f"color=c=black:s=540x960:r={FPS}:d={d:.2f},format=gray,"
-            f"geq=lum='255*lt(random(1),{density})',"
-            f"scale={W}:{H},format=rgb24,"
-            f"colorchannelmixer=rr={rm}:gg={gm}:bb={bm},"   # 上色要在轉 gbrp 之前(lutrgb 對 gbrp 不作用,實測)
-            f"format=gbrp{label}")
-
-
-def _tfx_sparkle_pink(d, p):     # Variety_03:粉紅亮片
-    fc = (f"[0:v]format=gbrp[base];{_sparkle_chain(d, 0.013, 1.0, 0.65, 0.8, '[sp]')};"
-          f"[base][sp]blend=all_mode=screen,format=yuv420p[out]")
+def _tfx_light_leak(d, p, workdir):
+    """漏光(Light_14 量測:粉白色、頂部最亮、強度隨時間 3→49 遞增)。
+    gradients 上亮下暗漸層 + fade 從黑淡入 + screen 疊底:
+    screen 疊黑等於沒疊,淡入曲線就是漏光成長曲線,零逐像素運算。"""
+    fc = (f"gradients=s={W}x{H}:c0=0xFFD8E8:c1=black:x0={W//2}:y0=0:x1={W//2}:y1={int(H*0.85)}"
+          f":r={FPS}:d={d:.2f},fade=t=in:st=0:d={max(d*0.8,0.1):.2f}[g];"
+          f"[0:v]null[v];[v][g]blend=all_mode=screen:shortest=1[out]")
     return ("fc", fc, "[out]")
 
 
-def _tfx_sparkle_white(d, p):    # Variety_08:白色亮片
-    fc = (f"[0:v]format=gbrp[base];{_sparkle_chain(d, 0.009, 1.0, 1.0, 1.0, '[sp]')};"
-          f"[base][sp]blend=all_mode=screen,format=yuv420p[out]")
+def _bokeh_png(workdir, size=260):
+    """柔邊白色光斑 PNG(高斯衰減),同一批只生成一次。"""
+    out = os.path.join(workdir, "_bokeh.png")
+    if not os.path.exists(out):
+        r = size // 2
+        run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", f"color=white:s={size}x{size}", "-frames:v", "1", "-vf",
+             f"format=yuva420p,geq=lum=255:a='255*exp(-((X-{r})*(X-{r})+(Y-{r})*(Y-{r}))/{(r*r)//3})'",
+             out])
+    return out
+
+
+def _tfx_particles(d, p, workdir):
+    """氛圍光斑(Atmosphere_06 量測:平均色偏≈0、逐格動態高=移動粒子)。
+    數顆半透明柔光圓緩慢往上飄。"""
+    png = _bokeh_png(workdir)
+    n = 5
+    fc = "[0:v]null[v0];"
+    for i in range(1, n + 1):
+        x0 = int(W * (0.08 + 0.8 * ((i * 37) % 10) / 10))
+        drift = 60 + (i * 23) % 90
+        speed = (H * (0.25 + 0.12 * i)) / max(d, 0.1)
+        alpha = 0.22 + 0.06 * (i % 3)
+        scale = 120 + (i * 53) % 220
+        fc += (f"[{i}:v]scale={scale}:-1,format=rgba,colorchannelmixer=aa={alpha:.2f}[b{i}];"
+               f"[v{i-1}][b{i}]overlay=x='{x0}+{drift}*sin(t*0.9+{i})':"
+               f"y='{H*0.9:.0f}-{speed:.0f}*t-{i*90}':shortest=1[v{i}];")
+    fc = fc.rstrip(";").replace(f"[v{n}]", "[out]")
+    return ("fci", fc, "[out]", [png] * n)
+
+
+def _tfx_flash_pulse(d, p, workdir):
+    """綜藝閃光(Variety_03 量測:平均≈0、高動態、脈衝式)。暖白短促亮閃,約一秒2.5次。"""
+    fc = (f"color=0xFFE8D8:s={W}x{H}:r={FPS}[w];[w]format=yuva420p,colorchannelmixer=aa=0.30[wf];"
+          f"[0:v]null[v];[v][wf]overlay=enable='gt(sin(2*PI*t*2.5),0.75)':shortest=1[out]")
     return ("fc", fc, "[out]")
 
 
-def _tfx_glow_burst(d, p):       # Atmosphere_06:開場紫紅閃光→白色光塵
-    fc = (f"[0:v]format=gbrp[base];"
-          f"color=c=0x9B4FD0:s={W}x{H}:r={FPS}:d={d:.2f},"
-          f"vignette=PI/3.5,fade=t=out:st=0.05:d=0.7,format=gbrp[fl];"
-          f"{_sparkle_chain(d, 0.003, 1.0, 1.0, 1.0, '[sp]')};"
-          f"[base][fl]blend=all_mode=screen[b1];"
-          f"[b1][sp]blend=all_mode=screen,format=yuv420p[out]")
+def _tfx_light_rays(d, p, workdir):
+    """白色光芒(Variety_08 截圖:頂部白色射線罩下來)。
+    白→黑直向漸層 + screen 疊底 = 柔和光瀑,零逐像素運算。"""
+    fc = (f"gradients=s={W}x{H}:c0=white:c1=black:x0={W//2}:y0=0:x1={W//2}:y1={int(H*0.7)}"
+          f":r={FPS}:d={d:.2f},format=yuva420p,colorchannelmixer=aa=0.35[g];"
+          f"[0:v]null[v];[v][g]overlay=shortest=1:format=auto[m];"
+          f"[m]eq=brightness=0.05[out]")
     return ("fc", fc, "[out]")
 
 
-def _tfx_light_sweep(d, p):      # Light_14:藍紫漏光從左上掃向右上、漸強
-    dd = max(d, 0.1)
-    fc = (f"[0:v]format=gbrp[base];"
-          f"color=c=black:s=270x480:r={FPS}:d={d:.2f},format=gray,"
-          f"geq=lum='min(T/{dd:.2f},1)*235*exp(-(pow(X-270*(0.12+0.62*T/{dd:.2f}),2)"
-          f"+pow(Y-90,2))/16200)',"
-          f"boxblur=6:2,scale={W}:{H},format=gbrp,"
-          f"lutrgb=r=val*0.8:g=val*0.6:b=val[lk];"
-          f"[base][lk]blend=all_mode=screen,format=yuv420p[out]")
-    return ("fc", fc, "[out]")
+def _tfx_shimmer(d, p, workdir):
+    """微光閃粉(Variety_08 量測:全畫面均勻微亮、中等動態)。細碎亮點+輕微提亮。"""
+    return ("vf", "noise=alls=14:allf=t+u,eq=brightness=0.02:saturation=1.05")
 
 
 TIMELINE_FX = {"circle_open": _tfx_circle_open, "grid": _tfx_grid, "grid3": _tfx_grid3,
                "grid2": _tfx_grid2, "rocking": _tfx_rocking, "stutter": _tfx_stutter,
-               "spin_in": _tfx_spin_in,
-               "glow_burst": _tfx_glow_burst, "light_sweep": _tfx_light_sweep,
-               "sparkle_pink": _tfx_sparkle_pink, "sparkle_white": _tfx_sparkle_white}
+               "spin_in": _tfx_spin_in, "light_leak": _tfx_light_leak,
+               "particles": _tfx_particles, "flash_pulse": _tfx_flash_pulse,
+               "shimmer": _tfx_shimmer, "light_rays": _tfx_light_rays}
 
 
 def render_timeline(normalized, duration, template, out, workdir):
     """把匯入模板的特效段套到正規化影片上。
-
-    模板時間軸和實際素材長度多半不同(模板22秒、素材可能8秒),
-    這裡把段落邊界「等比例縮放」到實際長度——每個特效都會出現,只是各自變短/變長。
-    沒有近似版的段落照原片播(不會失敗,只是那段沒特效)。
-    """
+    模板時間軸和實際素材長度多半不同,把段落邊界「等比縮放」到實際長度——
+    每個特效都會出現,只是各自變短/變長。沒有近似版的段落照原片播,不會失敗。"""
     src_dur = template.get("source_duration") or duration
     scale = duration / max(src_dur, 0.1)
     parts = []
@@ -465,14 +477,14 @@ def render_timeline(normalized, duration, template, out, workdir):
         a, b = s["start"] * scale, min(s["end"] * scale, duration)
         if b - a < 0.15 or a >= duration:
             continue
-        if a > cursor + 0.05:                      # 段落間的空隙照原片播
+        if a > cursor + 0.05:                      # 段落間空隙照原片播
             parts.append(cut_plain(cursor, a, f"g{i}"))
         fx = TIMELINE_FX.get(s["fx"])
         pth = os.path.join(workdir, f"_tl_{i}_{s['fx']}.mp4")
         if fx is None:
             parts.append(cut_plain(a, b, f"u{i}"))
         else:
-            kind, *rest = fx(b - a, s.get("params", {}))
+            kind, *rest = fx(b - a, s.get("params", {}), workdir)
             base = ["ffmpeg", "-y", "-loglevel", "error", "-i", normalized]
             pre_vf = f"trim={a:.3f}:{b:.3f},setpts=PTS-STARTPTS,scale={W}:{H}"
             if kind == "vf":
@@ -480,6 +492,9 @@ def render_timeline(normalized, duration, template, out, workdir):
                               "-c:v", "libx264", "-preset", "veryfast",
                               "-pix_fmt", "yuv420p", pth]
             else:
+                if kind == "fci":                  # 有額外輸入檔(如光斑PNG)
+                    for extra in rest[2]:
+                        base += ["-loop", "1", "-i", extra]
                 fc = rest[0].replace("[0:v]", f"[0:v]{pre_vf},", 1)
                 cmd = base + ["-filter_complex", fc, "-map", rest[1],
                               "-t", f"{b-a:.3f}", "-an", "-c:v", "libx264",
@@ -496,6 +511,7 @@ def render_timeline(normalized, duration, template, out, workdir):
 
 
 
+# ============ 字幕 ============
 
 def build_ass(ass_path, lines, total, style, timed=None):
     """timed 若提供,格式是 [(開始秒, 結束秒, 文字), ...],用真正對齊過的時間;
@@ -531,12 +547,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, Effect, Text
 
 def align_subtitles(voice_path, lines):
     """用 faster-whisper(免費、CPU可跑)聽出語音的實際時間分佈,
-    把逐字稿的每一句對到真正說話的時間點。
-
-    做法:辨識出「哪些時間段有人在講話、講了幾個字」,再把你的字幕句
-    依字數比例鋪在真實說話區間上(自動跳過開頭結尾的空白/呼吸)。
-    比逐字強制對齊輕量得多,對短影音的句級字幕已經足夠準。
-    任何一步失敗都回傳 None,外面就自動退回平均分配,不會讓整支失敗。"""
+    把逐字稿的每一句對到真正說話的時間點(自動跳過開頭結尾的空白)。
+    任何一步失敗都回傳 None,外面自動退回平均分配,不會讓整支失敗。"""
     if not voice_path or not lines:
         return None
     try:
@@ -572,8 +584,7 @@ TTS_DEFAULT = "zh-TW-HsiaoChenNeural"
 
 
 def synthesize_voice(text, out_path, voice_name=None):
-    """把文字轉成語音檔(mp3)。voice_name 可以是「曉臻/曉雨/雲哲」或完整聲線代號。
-    成功回傳 out_path,失敗丟例外(由呼叫端決定要不要繼續)。"""
+    """文字轉語音(mp3)。voice_name 可用「曉臻/曉雨/雲哲」或完整聲線代號。"""
     import asyncio
     import edge_tts
     voice = TTS_VOICES.get((voice_name or "").strip(), None) or \
