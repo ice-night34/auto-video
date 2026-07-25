@@ -345,28 +345,42 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
         log(f"正規化完成：{duration:.2f} 秒"
             f"（語音 {voice_dur:.2f} 秒，字幕 {len(subtitle_lines or [])} 句）")
 
-        out_folder_id = create_folder(up_drive, done_id, name)
+        # 成品放在「02_完成/YYYY-MM-DD/批次名稱」,按日期分層,不會全部堆在一起
+        import datetime
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        date_folder_id = create_folder(up_drive, done_id, today)
+        out_folder_id = create_folder(up_drive, date_folder_id, name)
 
         for tpl in templates:
             wd = os.path.join(workdir, f"wd_{tpl['id']}")
             os.makedirs(wd, exist_ok=True)
-            out_path = os.path.join(wd, f"{tpl['id']}_{name}.mp4")
-            try:
-                t0 = time.time()
-                log(f"  → 開始 {tpl['id']} {tpl['name']}")
-                # 音樂隨機抽（沒音樂就無法做，報明確錯）
+            import datetime as _dt
+            date_prefix = _dt.date.today().strftime("%m%d")
+            out_path = os.path.join(wd, f"{date_prefix}_{tpl['id']}_{name}.mp4")
+            def _run_one(attempt=1):
+                """跑單一模板,失敗回傳例外物件而非直接丟出。"""
                 if not music_paths:
                     raise RuntimeError("Drive「音樂」資料夾沒有可用音樂")
                 music = random.choice(music_paths)
-                # 貼圖：依模板分類抽 0~n 個（空分類自動變沒貼圖）
                 pool = sticker_pools.get(tpl.get("sticker_pool"), [])
                 stickers = render.pick_stickers(pool, tuple(tpl.get("sticker_count", [0, 0])))
-
                 info = render.apply_template(
                     normalized, duration, tpl, out_path, music,
                     voice_path=voice_path, subtitle_lines=subtitle_lines,
                     subtitle_timed=subtitle_timed,
                     sticker_paths=stickers, workdir=wd)
+                return info
+
+            try:
+                t0 = time.time()
+                log(f"  → 開始 {tpl['id']} {tpl['name']}")
+                try:
+                    info = _run_one(attempt=1)
+                except Exception as e1:
+                    # 第一次失敗:等3秒重試一次(應對短暫的 ffmpeg 逾時或網路問題)
+                    log(f"     ⚠️ 第一次失敗({type(e1).__name__}),3秒後重試...")
+                    time.sleep(3)
+                    info = _run_one(attempt=2)   # 若再失敗就讓外層 except 接
                 size_mb = os.path.getsize(out_path) / 1024 / 1024
                 log(f"     剪片完成 {time.time()-t0:.1f}s（{size_mb:.1f}MB），開始上傳...")
                 tu = time.time()
@@ -374,7 +388,7 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
                 log(f"  ✅ {tpl['id']} 完成（{info}｜上傳 {time.time()-tu:.1f}s｜共 {time.time()-t0:.1f}s）")
                 ok.append(tpl["id"])
             except Exception as e:
-                log(f"  ❌ {tpl['id']} 失敗：{e}")
+                log(f"  ❌ {tpl['id']} 兩次都失敗：{e}")
                 failed.append(f"{tpl['id']}({type(e).__name__})")
             finally:
                 shutil.rmtree(wd, ignore_errors=True)
