@@ -11,10 +11,10 @@ jobs:
       - name: 取得程式碼
         uses: actions/checkout@v4
 
-      - name: 安裝 ffmpeg 與中文字型
+      - name: 安裝 ffmpeg 與字型
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-noto-cjk
+          sudo apt-get install -y -qq ffmpeg fonts-noto-cjk fonts-noto-color-emoji
 
       - name: 設定 Python
         uses: actions/setup-python@v5
