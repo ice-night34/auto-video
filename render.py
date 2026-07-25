@@ -683,9 +683,105 @@ def _sticker_filter(idx, motion, slot, total_count, duration):
 
 # ============ 套模板 ============
 
-def apply_fixed_texts(last_label, template, duration, filters):
-    """把模板裡的 fixed_texts(固定文字方塊)用 drawtext 疊進 filter_complex。
-    座標 cx/cy 是 0~1 中心點相對值。字體找不到就退回 Noto Sans CJK TC。
+def _has_emoji(text):
+    """判斷字串裡有沒有 emoji(Unicode 表情符號範圍)"""
+    import unicodedata
+    for ch in text:
+        cp = ord(ch)
+        if (0x1F300 <= cp <= 0x1FBFF or   # 各類 emoji
+            0x2600  <= cp <= 0x27BF or    # 雜項符號
+            0xFE00  <= cp <= 0xFE0F or    # 變體選擇器
+            0x1F1E0 <= cp <= 0x1F1FF):    # 國旗字母
+            return True
+    return False
+
+
+def _render_text_to_png(text, font_path, font_size, color_hex, out_png, canvas_w, canvas_h, cx, cy):
+    """用 Pillow 把文字(含 emoji)畫成透明 PNG。
+    中文/英文用模板字體,emoji 用 NotoColorEmoji 字體縮放後拼在一起。
+    color_hex 格式是 '0xRRGGBB'。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    import re as _re
+
+    EMOJI_FONT_PATH = '/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf'
+    CJK_FONT_PATH   = '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
+
+    hex_str = color_hex.replace('0x', '').replace('#', '')
+    r, g, b = int(hex_str[0:2],16), int(hex_str[2:4],16), int(hex_str[4:6],16)
+
+    try:
+        main_fnt = ImageFont.truetype(font_path or CJK_FONT_PATH, font_size)
+    except Exception:
+        main_fnt = ImageFont.truetype(CJK_FONT_PATH, font_size)
+
+    try:
+        emoji_fnt = ImageFont.truetype(EMOJI_FONT_PATH, 109)
+    except Exception:
+        emoji_fnt = main_fnt
+
+    emoji_pat = _re.compile(
+        r'[🌀-🯿☀-➿🇠-🇿︀-️]+',
+        flags=_re.UNICODE)
+
+    # 把文字切成 [(chunk, is_emoji)] 交替段
+    segs, last = [], 0
+    for m in emoji_pat.finditer(text):
+        if m.start() > last:
+            segs.append((text[last:m.start()], False))
+        segs.append((m.group(), True))
+        last = m.end()
+    if last < len(text):
+        segs.append((text[last:], False))
+
+    # 量測每段寬高
+    height = font_size + 24
+    chunks = []
+    for seg, is_emoji in segs:
+        if not seg:
+            continue
+        if is_emoji:
+            tmp = Image.new('RGBA',(1,1))
+            d = ImageDraw.Draw(tmp)
+            bb = d.textbbox((0,0), seg, font=emoji_fnt, embedded_color=True)
+            raw_w, raw_h = bb[2]-bb[0]+4, bb[3]-bb[1]+4
+            scaled_h = int(font_size * 0.9)
+            scaled_w = int(raw_w * (scaled_h / max(raw_h, 1)))
+            chunks.append((seg, True, scaled_w, scaled_h, raw_w, raw_h, bb))
+        else:
+            tmp = Image.new('RGBA',(1,1))
+            d = ImageDraw.Draw(tmp)
+            bb = d.textbbox((0,0), seg, font=main_fnt)
+            w = bb[2]-bb[0]+4
+            chunks.append((seg, False, w, font_size, 0, 0, bb))
+
+    total_w = sum(c[2] for c in chunks) + 8
+    canvas = Image.new('RGBA', (max(total_w,1), height), (0,0,0,0))
+    x, baseline = 4, height - 10
+
+    for chunk in chunks:
+        seg, is_emoji, sw, sh, raw_w, raw_h, bb = chunk
+        if is_emoji:
+            e_img = Image.new('RGBA',(max(raw_w,1),max(raw_h,1)),(0,0,0,0))
+            d2 = ImageDraw.Draw(e_img)
+            d2.text((-bb[0]+2,-bb[1]+2), seg, font=emoji_fnt, embedded_color=True)
+            if sw > 0 and sh > 0:
+                e_img = e_img.resize((sw, sh), Image.LANCZOS)
+            canvas.paste(e_img, (x, baseline-sh), e_img)
+            x += sw + 2
+        else:
+            draw = ImageDraw.Draw(canvas)
+            draw.text((x, baseline-font_size-bb[1]), seg, font=main_fnt, fill=(r,g,b,255))
+            x += sw
+
+    canvas.save(out_png)
+    return canvas.width, canvas.height
+
+
+def apply_fixed_texts(last_label, template, duration, filters, workdir=None, out_path=None):
+    """把模板裡的 fixed_texts 疊到影片上。
+    含 emoji 的文字 → 用 Pillow 畫成 PNG 再用 overlay 疊(支援完整 emoji)。
+    純文字 → 繼續用 ffmpeg drawtext(速度快)。
     """
     texts = template.get("fixed_texts", [])
     if not texts:
@@ -694,10 +790,11 @@ def apply_fixed_texts(last_label, template, duration, filters):
     fallback_font = "Noto Sans CJK TC"
     src_dur = template.get("source_duration") or duration
     scale = duration / max(src_dur, 0.1)
+    # workdir 回退:從 out_path 推,或用 /tmp
+    wd = workdir or (os.path.dirname(out_path) if out_path else "/tmp")
 
     for i, t in enumerate(texts):
-        raw = t.get("text", "")
-        text = raw.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+        raw    = t.get("text", "")
         cx     = t.get("cx", 0.5)
         cy     = t.get("cy", 0.5)
         sz     = t.get("font_size", 64)
@@ -705,24 +802,137 @@ def apply_fixed_texts(last_label, template, duration, filters):
         fp     = t.get("font_path")
         t_start = round(t.get("start", 0.0) * scale, 3)
         t_end   = round(min(t.get("end", duration) * scale, duration), 3)
-
-        if fp and os.path.exists(fp):
-            font_arg = f"fontfile={fp}"
-        else:
-            font_arg = f"font={fallback_font}"
-
-        x_expr = f"(w-text_w)/2+({cx:.4f}-0.5)*w"
-        y_expr = f"{cy:.4f}*h-text_h/2"
         enable = f"between(t,{t_start},{t_end})"
         out_label = f"[ft{i}]"
-        filters.append(
-            f"{last_label}drawtext={font_arg}:text='{text}'"
-            f":fontcolor={color}:fontsize={sz}"
-            f":x='{x_expr}':y='{y_expr}'"
-            f":enable='{enable}'{out_label}"
-        )
+
+        if _has_emoji(raw):
+            # Pillow 路線:畫成 PNG 再用 overlay 疊
+            # PNG 路徑和輸入索引存進 filters 之前的特殊標記,由 apply_template 統一處理
+            png = os.path.join(wd, f"_ftpng{i}.png")
+            try:
+                tw, th = _render_text_to_png(raw, fp, sz, color, png, W, H, cx, cy)
+                x_px = int(cx * W - tw / 2)
+                y_px = int(cy * H - th / 2)
+                # 用特殊標記讓 apply_template 知道要加 -i png
+                filters.append(f"__PNG_OVERLAY__:{png}:{x_px}:{y_px}:{enable}:{out_label}:{last_label}")
+            except Exception as e:
+                print(f"⚠️ 文字 PNG 渲染失敗,改用 drawtext:{e}", flush=True)
+                text = raw.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+                font_arg = f"fontfile={fp}" if fp and os.path.exists(fp) else f"font={fallback_font}"
+                x_expr = f"(w-text_w)/2+({cx:.4f}-0.5)*w"
+                y_expr = f"{cy:.4f}*h-text_h/2"
+                filters.append(
+                    f"{last_label}drawtext={font_arg}:text='{text}':fontcolor={color}:fontsize={sz}"
+                    f":x='{x_expr}':y='{y_expr}':enable='{enable}'{out_label}"
+                )
+        else:
+            # 純文字走 drawtext(快)
+            text = raw.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+            font_arg = f"fontfile={fp}" if fp and os.path.exists(fp) else f"font={fallback_font}"
+            x_expr = f"(w-text_w)/2+({cx:.4f}-0.5)*w"
+            y_expr = f"{cy:.4f}*h-text_h/2"
+            filters.append(
+                f"{last_label}drawtext={font_arg}:text='{text}':fontcolor={color}:fontsize={sz}"
+                f":x='{x_expr}':y='{y_expr}':enable='{enable}'{out_label}"
+            )
         last_label = out_label
     return last_label
+
+
+def apply_sticker_keyframes(normalized, duration, template, sticker_paths, workdir):
+    """依照模板的關鍵幀路徑,把貼圖用 overlay+缓動線性內插 疊到影片上。
+    每個貼圖軌對應一張從 Drive 貼圖庫隨機抽的圖。
+    關鍵幀之間用線性內插,ffmpeg 的 overlay x/y 直接用 t 做運算式。
+    """
+    sticker_tracks = template.get("sticker_tracks", [])
+    if not sticker_tracks or not sticker_paths:
+        return normalized
+
+    # 每個貼圖軌對應一張貼圖
+    used = [sticker_paths[i % len(sticker_paths)] for i in range(len(sticker_tracks))]
+    result = normalized
+
+    for si, (st, sp) in enumerate(zip(sticker_tracks, used)):
+        kfs = st["keyframes"]
+        if not kfs:
+            continue
+        t_start = st["start"]
+        t_end   = st["end"]
+
+        # 預縮貼圖:用第一幀的 w 比例決定像素大小
+        stk_w = max(60, int(kfs[0]["w"] * W))
+        small = _prescale_sticker(sp, stk_w, workdir, f"kf{si}")
+
+        # 建立 x/y 的分段線性運算式(ffmpeg 的 if/between)
+        def interp_expr(axis):
+            # axis = 'cx' or 'cy', 轉成像素
+            scale = W if axis == "cx" else H
+            pts = [(kf["t"], kf[axis] * scale) for kf in kfs]
+            if len(pts) == 1:
+                return f"{pts[0][1]:.1f}-w/2" if axis == "cx" else f"{pts[0][1]:.1f}-h/2"
+            expr = ""
+            for i in range(len(pts) - 1):
+                t0, v0 = pts[i]
+                t1, v1 = pts[i+1]
+                dt = max(t1 - t0, 0.001)
+                slope = (v1 - v0) / dt
+                seg = f"between(t,{t0:.4f},{t1:.4f})*({v0:.1f}+{slope:.4f}*(t-{t0:.4f}))"
+                expr += ("+" if expr else "") + seg
+            # t > 最後一幀:固定最後位置
+            expr += f"+gt(t,{pts[-1][0]:.4f})*{pts[-1][1]:.1f}"
+            offset = "-w/2" if axis == "cx" else "-h/2"
+            return f"({expr}){offset}"
+
+        x_expr = interp_expr("cx")
+        y_expr = interp_expr("cy")
+        enable = f"between(t,{t_start:.3f},{t_end:.3f})"
+
+        out = os.path.join(workdir, f"_kfstk{si}.mp4")
+        run(["ffmpeg","-y","-loglevel","error",
+             "-i", result,
+             "-loop","1","-i", small,
+             "-filter_complex",
+             f"[1:v]format=rgba[s];[0:v][s]overlay=x='{x_expr}':y='{y_expr}':enable='{enable}':shortest=1[out]",
+             "-map","[out]","-an",
+             "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p",
+             "-t",str(duration), out], step=f"貼圖關鍵幀 {si+1}/{len(sticker_tracks)}")
+        result = out
+
+    return result
+
+
+def apply_clip_order(normalized, duration, clip_order, workdir):
+    """按模板的剪接比例,把素材切成幾段重新排列。
+    clip_order 每項: {duration_ratio, in_ratio, out_ratio}
+    duration_ratio: 這段佔成品總長的比例
+    in_ratio/out_ratio: 從素材的哪個比例位置剪到哪個比例位置
+    """
+    if not clip_order:
+        return normalized
+
+    parts = []
+    for i, c in enumerate(clip_order):
+        seg_dur = round(duration * c["duration_ratio"], 3)
+        src_in  = round(duration * c["in_ratio"], 3)
+        src_out = round(duration * c["out_ratio"], 3)
+        # 確保 src_out 不超過實際長度
+        src_out = min(src_out, duration)
+        if src_out - src_in < 0.1 or seg_dur < 0.05:
+            continue
+        p = os.path.join(workdir, f"_co{i}.mp4")
+        run(["ffmpeg","-y","-loglevel","error",
+             "-i", normalized,
+             "-vf", f"trim={src_in:.3f}:{src_out:.3f},setpts=PTS-STARTPTS,scale={W}:{H}",
+             "-an","-c:v","libx264","-preset","veryfast",
+             "-pix_fmt","yuv420p","-t",str(seg_dur), p])
+        parts.append(p)
+
+    if not parts:
+        return normalized
+
+    out = os.path.join(workdir, "_co_joined.mp4")
+    _concat_files(parts, out, workdir, "co")
+    return out
 
 def apply_template(normalized, duration, template, out_path, music_path,
                    voice_path=None, subtitle_lines=None, subtitle_timed=None,
@@ -730,6 +940,12 @@ def apply_template(normalized, duration, template, out_path, music_path,
     opening = template.get("opening", "zoom_in")
     workdir = workdir or os.path.dirname(out_path)
     sticker_paths = sticker_paths or []
+
+    # 剪接重排:在正規化素材上先按模板順序重排片段
+    clip_order = template.get("clip_order", [])
+    if clip_order:
+        co_path = os.path.join(workdir, f"_co_{template['id']}.mp4")
+        normalized = apply_clip_order(normalized, duration, clip_order, workdir)
 
     processed = normalized
     if template.get("type") == "timeline":
@@ -799,14 +1015,32 @@ def apply_template(normalized, duration, template, out_path, music_path,
         filters.append(f"{last}fade=t=out:st={max(duration-d,0)}:d={d}[vfade]")
         last = "[vfade]"
 
-    slot_order = random.sample(range(8), 8)   # 位置順序每支影片重洗
-    for n, sidx in enumerate(sticker_indices):
-        motion = random.choice(template.get("sticker_motion", ["enter"]))
-        inp, ov, _ = _sticker_filter(sidx, motion, slot_order[n % 8],
-                                     len(sticker_indices), duration)
-        filters.append(inp)
-        filters.append(f"{last}[s{sidx}]{ov}[st{n}]")
-        last = f"[st{n}]"
+    # 貼圖渲染模式:有關鍵幀路徑就走關鍵幀,否則走原本的隨機飄動
+    sticker_tracks = template.get("sticker_tracks", [])
+    if sticker_tracks and sticker_paths:
+        # 關鍵幀模式:先把貼圖疊到 processed,得到新的影片再接回主流程
+        kf_result = apply_sticker_keyframes(processed, duration, template, sticker_paths, workdir)
+        if kf_result != processed:
+            processed = kf_result
+            # cmd 已用 processed 建好,直接換掉那個路徑
+            for ci, cv in enumerate(cmd):
+                if cv == os.path.join(workdir, f"_tl_{template['id']}.mp4") or                    cv == os.path.join(workdir, f"_pre_{template['id']}.mp4") or                    cv == normalized:
+                    cmd[ci] = processed
+                    break
+            else:
+                # 找不到就換第3個元素(normalized 的原始位置)
+                cmd[2] = processed
+        # 跳過後面的隨機貼圖邏輯
+        sticker_indices = []
+    else:
+        slot_order = random.sample(range(8), 8)   # 位置順序每支影片重洗
+        for n, sidx in enumerate(sticker_indices):
+            motion = random.choice(template.get("sticker_motion", ["enter"]))
+            inp, ov, _ = _sticker_filter(sidx, motion, slot_order[n % 8],
+                                         len(sticker_indices), duration)
+            filters.append(inp)
+            filters.append(f"{last}[s{sidx}]{ov}[st{n}]")
+            last = f"[st{n}]"
 
     if subtitle_lines:
         ass = os.path.splitext(out_path)[0] + ".ass"
@@ -828,6 +1062,22 @@ def apply_template(normalized, duration, template, out_path, music_path,
         aout = "[aout]"
     else:
         aout = "[music]"
+
+    # 展開 __PNG_OVERLAY__ 標記:把 PNG 加為 -i 輸入,轉成真正的 overlay filter
+    real_filters = []
+    for f in filters:
+        if f.startswith("__PNG_OVERLAY__:"):
+            parts = f.split(":", 6)  # __PNG_OVERLAY__:png:x:y:enable:out_label:in_label
+            _, png_path, x_px, y_px, enable_expr, out_lbl, in_lbl = parts
+            png_idx = len([c for c in cmd if c == "-i"]) - 1 + 1
+            cmd += ["-loop", "1", "-i", png_path]
+            real_filters.append(
+                f"[{png_idx}:v]format=rgba[fpng{png_idx}];"
+                f"{in_lbl}[fpng{png_idx}]overlay=x={x_px}:y={y_px}:enable='{enable_expr}':shortest=1{out_lbl}"
+            )
+        else:
+            real_filters.append(f)
+    filters = real_filters
 
     cmd += ["-filter_complex", ";".join(filters), "-map", last, "-map", aout,
             "-t", str(duration), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
