@@ -128,11 +128,56 @@ def _parse_texts(d, zip_path=None):
     return texts
 
 
+
+def _parse_sticker_tracks(d, zip_path=None):
+    """掃貼圖軌(mime=image/sticker),讀出關鍵幀移動路徑。
+    回傳 list of dict:
+    {
+      start, end,           # 在時間軸上的出現時間(秒)
+      keyframes: [          # 依時間排序
+        {t, cx, cy, w, h, r}  # t=秒, cx/cy=中心點0~1, w/h=相對尺寸, r=旋轉度
+      ]
+    }
+    威力導演的貼圖是內建素材,檔案不在匯出包裡,
+    所以這裡只存移動路徑,實際貼圖圖片由使用者的 Drive 貼圖庫提供。
+    """
+    sticker_tracks = []
+    for tr in d.get("tracks", []):
+        for u in tr.get("timelineUnit", []):
+            b, e = u.get("beginUs", 0) / 1e6, u.get("endUs", 0) / 1e6
+            if e <= b:
+                continue
+            clip = u.get("timelineClip", {}) or {}
+            if clip.get("mime-type") != "image/sticker":
+                continue
+            kf_raw = clip.get("keyframe", {})
+            transform = kf_raw.get("keyframes", {}).get("transform", {}) if isinstance(kf_raw, dict) else {}
+            if not transform:
+                continue
+            keyframes = []
+            for t_str, v in sorted(transform.items(), key=lambda x: float(x[0])):
+                keyframes.append({
+                    "t": round(float(t_str), 4),
+                    "cx": round(v.get("x", 0.5), 4),
+                    "cy": round(v.get("y", 0.5), 4),
+                    "w": round(v.get("w", 0.2), 4),
+                    "h": round(v.get("h", 0.2), 4),
+                    "r": round(v.get("r", 0), 2),
+                })
+            if keyframes:
+                sticker_tracks.append({
+                    "start": round(b, 3),
+                    "end": round(e, 3),
+                    "keyframes": keyframes,
+                })
+    return sticker_tracks
+
 def parse_pdrproj(path):
     """回傳 (segments, media, unsupported, particle_hits, fixed_texts)"""
     d = _load_pdrproj(path)
     segments, media, unsupported, particle_hits = [], set(), [], []
     fixed_texts = _parse_texts(d, zip_path=path if path.lower().endswith(".zip") else None)
+    sticker_tracks = _parse_sticker_tracks(d)
 
     for tr in d.get("tracks", []):
         for u in tr.get("timelineUnit", []):
@@ -162,11 +207,11 @@ def parse_pdrproj(path):
             segments.append({"start": round(b, 2), "end": round(e, 2),
                              "fx": mapped, "params": params, "raw": key})
     segments.sort(key=lambda s: s["start"])
-    return segments, sorted(media), unsupported, particle_hits, fixed_texts
+    return segments, sorted(media), unsupported, particle_hits, fixed_texts, sticker_tracks
 
 
 def convert(src_path, out_path, template_id=None):
-    segments, media, unsupported, particles, fixed_texts = parse_pdrproj(src_path)
+    segments, media, unsupported, particles, fixed_texts, sticker_tracks = parse_pdrproj(src_path)
     tid = template_id or os.path.splitext(os.path.basename(out_path))[0].replace("template_", "").upper()
 
     # 字體檔:如果有附在 zip 裡就複製到模板 json 旁邊,讓 render 時找得到
@@ -180,6 +225,29 @@ def convert(src_path, out_path, template_id=None):
             # 改成相對於 out_dir 的路徑,讓 render 時用同一目錄找字體
             t["font_path"] = dest
 
+    # 主影片軌剪接順序(按時間比例套到新素材)
+    clip_order = []
+    for tr in _load_pdrproj(src_path).get("tracks", []):
+        if tr.get("type") != 1:
+            continue
+        units = sorted([u for u in tr.get("timelineUnit",[])
+                        if u.get("endUs",0) > u.get("beginUs",0)],
+                       key=lambda u: u["beginUs"])
+        if not units:
+            continue
+        total_in = sum(u["endUs"]-u["beginUs"] for u in units)
+        for u in units:
+            clip = u.get("timelineClip", {}) or {}
+            dur = (u["endUs"] - u["beginUs"]) / 1e6
+            in_t = clip.get("inTimeUs", 0) / 1e6
+            out_t = clip.get("outTimeUs", 0) / 1e6
+            clip_order.append({
+                "duration_ratio": round(dur * 1e6 / max(total_in, 1), 4),
+                "in_ratio": round(in_t / max(out_t, 0.001), 4),
+                "out_ratio": 1.0,
+            })
+        break   # 只讀第一條影片軌
+
     tpl = {
         "id": tid,
         "name": f"匯入:{os.path.splitext(os.path.basename(src_path))[0]}",
@@ -187,7 +255,9 @@ def convert(src_path, out_path, template_id=None):
         "source_duration": max((s["end"] for s in segments), default=0),
         "segments": segments,
         "unsupported": [u["fx"] for u in unsupported],
-        "fixed_texts": fixed_texts,          # ← 新增:固定文字方塊
+        "fixed_texts": fixed_texts,          # 固定文字方塊
+        "sticker_tracks": sticker_tracks,      # 貼圖關鍵幀移動路徑
+        "clip_order": clip_order,               # 主影片軌剪接順序
         "end_fade_out": 0.5,
         "sticker_pool": "浮誇" if particles else "一般",
         "sticker_count": [3, 6] if particles else [0, 2],
