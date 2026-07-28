@@ -345,11 +345,7 @@ def process_batch(drive, user_drive, batch, inbox_id, done_id, archive_id,
         log(f"正規化完成：{duration:.2f} 秒"
             f"（語音 {voice_dur:.2f} 秒，字幕 {len(subtitle_lines or [])} 句）")
 
-        # 成品放在「02_完成/YYYY-MM-DD/批次名稱」,按日期分層,不會全部堆在一起
-        import datetime
-        today = datetime.date.today().strftime("%Y-%m-%d")
-        date_folder_id = create_folder(up_drive, done_id, today)
-        out_folder_id = create_folder(up_drive, date_folder_id, name)
+        out_folder_id = create_folder(up_drive, done_id, name)
 
         for tpl in templates:
             wd = os.path.join(workdir, f"wd_{tpl['id']}")
